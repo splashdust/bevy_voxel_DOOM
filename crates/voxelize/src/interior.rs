@@ -118,9 +118,10 @@ impl VoxelMap {
                     let c = li.cross(px, py);
                     (px + 2.0 * c * li.dir[1], py - 2.0 * c * li.dir[0])
                 };
-                let (texel, table) =
-                    self.wall_texel_at(near.line, near.air, p, air_point, (0, 0));
-                return self.darkened(texel, table, wall_depth);
+                // Only surface voxels glow: a lamp's texture carried into the
+                // solid is plain.
+                let w = self.wall_texel_at(near.line, near.air, p, air_point, (0, 0));
+                return self.darkened(w.texel, w.table, wall_depth);
             }
         }
         match own {

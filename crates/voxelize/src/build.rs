@@ -8,6 +8,7 @@ use doom_wad::{
 };
 
 use crate::interior::INTERIOR_DEPTH;
+use crate::lamps::{self, Lamps};
 use crate::locate::Locator;
 use crate::tiles::{Stats, Tiles};
 use crate::{
@@ -105,6 +106,7 @@ impl VoxelMap {
                 floor_flat: flat_ids.id(&sec.floor_flat, &textures.flats),
                 ceiling_flat: flat_ids.id(&sec.ceiling_flat, &textures.flats),
                 flat_table: table(light::flat_table(sec.light)),
+                lamp_level: lamps::sector_level(options.lamps, sec.light),
             })
             .collect();
         // A sector with its ceiling below its floor has no air.
@@ -161,6 +163,10 @@ impl VoxelMap {
                             map.sectors[sd.sector as usize].light,
                             contrast,
                         )),
+                        lamp_level: lamps::sector_level(
+                            options.lamps,
+                            map.sectors[sd.sector as usize].light,
+                        ),
                     })
                 });
                 let a = map.vertexes[l.v1 as usize];
@@ -215,11 +221,14 @@ impl VoxelMap {
             tiles: Tiles::new(0, 0, |_, _| Stats::VOID),
             spawn: ([0.0; 3], 0.0),
             sky: [90, 110, 140],
+            lamps: Lamps::default(),
         };
         vm.lines = vm.line_grid(map);
         vm.near = vm.near_grid();
         vm.tiles = vm.tile_stats();
         vm.spawn = vm.find_spawn(map, &locator);
+        vm.lamps =
+            Lamps::build(&vm, map, &flat_ids.order, &wall_ids.order, options.lamps);
         if let Some(sky) = textures.walls.get(sky_texture_name(&map.name)) {
             vm.sky = average_colour(sky, &vm.palette).unwrap_or(vm.sky);
         }

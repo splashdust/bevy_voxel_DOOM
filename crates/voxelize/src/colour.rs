@@ -5,7 +5,18 @@
 
 use doom_wad::{ML_DONTPEGBOTTOM, ML_DONTPEGTOP};
 
-use crate::{LineInfo, SideInfo, Voxel, VoxelMap, NO_LINE, NO_TEX};
+use crate::{LineInfo, SectorInfo, SideInfo, Voxel, VoxelMap, NO_LINE, NO_TEX};
+
+/// A wall texel as [`VoxelMap::wall_texel_at`] finds it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WallTexel {
+    /// The unlit palette index.
+    pub texel: u8,
+    /// The light table.
+    pub table: u8,
+    /// The emission level when the texel glows, else 0.
+    pub lamp: u8,
+}
 
 impl VoxelMap {
     /// The voxel centre in map units: x, DOOM y, height.
@@ -18,9 +29,18 @@ impl VoxelMap {
         )
     }
 
-    /// A flat's lit colour above or below voxel column `(x, z)`.
-    pub(crate) fn flat(&self, flat: u16, table: u8, x: i32, z: i32) -> u8 {
-        self.tables[table as usize][self.flat_texel(flat, x, z) as usize]
+    /// The voxel of a flat of sector `sec` above or below voxel column
+    /// `(x, z)`: emissive where it is a bright texel of a light flat, and
+    /// otherwise solid in the sector's light.
+    pub(crate) fn flat(&self, flat: u16, sec: &SectorInfo, x: i32, z: i32) -> Voxel {
+        let texel = self.flat_texel(flat, x, z);
+        if sec.lamp_level > 0 && self.lamps.flat_glows(flat, texel) {
+            return Voxel::Emissive {
+                index: texel,
+                level: sec.lamp_level,
+            };
+        }
+        Voxel::Solid(self.tables[sec.flat_table as usize][texel as usize])
     }
 
     /// A flat's texel above or below voxel column `(x, z)`, unlit. Flats
@@ -45,17 +65,23 @@ impl VoxelMap {
         air: u16,
         [x, y, z]: [i32; 3],
         (dx, dz): (i32, i32),
-    ) -> u8 {
+    ) -> Voxel {
         let line = self.lines[col] & !crate::MASKED;
         let (ax, ay, _) = self.centre(x + dx, y, z + dz);
-        let (texel, table) = self.wall_texel_at(line, air, [x, y, z], (ax, ay), (dx, dz));
-        self.tables[table as usize][texel as usize]
+        let w = self.wall_texel_at(line, air, [x, y, z], (ax, ay), (dx, dz));
+        if w.lamp > 0 {
+            return Voxel::Emissive {
+                index: w.texel,
+                level: w.lamp,
+            };
+        }
+        Voxel::Solid(self.tables[w.table as usize][w.texel as usize])
     }
 
     /// The unlit texel and light table of the wall of linedef `line` at
     /// voxel `[x, y, z]`, as seen from air of sector `air`, which lies on the
     /// side of map point `air_point`. Without a texture there it is the air
-    /// sector's floor flat at column `(x + dx, z + dz)`.
+    /// sector's floor flat at column `(x + dx, z + dz)`, which never glows.
     pub(crate) fn wall_texel_at(
         &self,
         line: u16,
@@ -63,12 +89,13 @@ impl VoxelMap {
         [x, y, z]: [i32; 3],
         air_point: (f64, f64),
         (dx, dz): (i32, i32),
-    ) -> (u8, u8) {
+    ) -> WallTexel {
         let air_sec = &self.sectors[air as usize];
-        let fallback = (
-            self.flat_texel(air_sec.floor_flat, x + dx, z + dz),
-            air_sec.flat_table,
-        );
+        let fallback = WallTexel {
+            texel: self.flat_texel(air_sec.floor_flat, x + dx, z + dz),
+            table: air_sec.flat_table,
+            lamp: 0,
+        };
         if line == NO_LINE {
             return fallback;
         }
@@ -138,7 +165,15 @@ impl VoxelMap {
             }
         };
         match self.wall_texel(li, side, facing, tex, top, px, py, h) {
-            Some(t) => (t, side.table),
+            Some(texel) => WallTexel {
+                texel,
+                table: side.table,
+                lamp: if side.lamp_level > 0 && self.lamps.wall_glows(tex, texel) {
+                    side.lamp_level
+                } else {
+                    0
+                },
+            },
             None => fallback,
         }
     }

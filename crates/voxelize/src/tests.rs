@@ -8,7 +8,7 @@ use doom_wad::{
     TextureSet, Thing, Vertex, ML_TWOSIDED, NF_SUBSECTOR,
 };
 
-use crate::{Options, Voxel, VoxelMap, INTERIOR, INTERIOR_DEPTH};
+use crate::{LampLevel, Options, Voxel, VoxelMap, INTERIOR, INTERIOR_DEPTH};
 
 const H: i16 = 128;
 
@@ -206,6 +206,16 @@ fn textures() -> TextureSet {
         picture(16, 32, |u, v| (u % 4 != 1).then_some(100 + v as u8)),
     );
     walls.insert("SKY1".into(), picture(4, 4, |_, _| Some(3)));
+    // A light flat: texel 250 where u % 4 == 1, 20 elsewhere.
+    flats.insert(
+        "TLITE6_4".into(),
+        picture(64, 64, |u, _| Some(if u % 4 == 1 { 250 } else { 20 })),
+    );
+    // A light wall: 240 in its top 64 rows, 30 below.
+    walls.insert(
+        "LITE3".into(),
+        picture(64, 128, |_, v| Some(if v < 64 { 240 } else { 30 })),
+    );
     TextureSet { flats, walls }
 }
 
@@ -270,8 +280,43 @@ fn build(open_doors: bool, sector_light: bool) -> VoxelMap {
         units_per_voxel: 2,
         sector_light,
         open_doors,
+        lamps: None,
     };
     VoxelMap::from_map_data(&test_map(), palette(), &colormap(), &textures(), &options)
+        .unwrap()
+}
+
+/// The test map with light sources: room A's ceiling is a light flat, its
+/// south wall a light texture, a red tall torch stands in A, a candle in
+/// sky room D, and a multiplayer-only torch in A that isn't drawn.
+fn lamp_map() -> MapData {
+    let mut map = test_map();
+    map.sectors[0].ceiling_flat = "TLITE6_4".into();
+    // Linedef 0, A's south wall, has sidedef 0.
+    map.sidedefs[0].middle = "LITE3".into();
+    let thing = |x, y, kind, flags| Thing {
+        x,
+        y,
+        angle: 0,
+        kind,
+        flags,
+    };
+    map.things.extend([
+        thing(64, 32, 46, 7),
+        thing(260, 64, 34, 7),
+        thing(100, 100, 46, 7 | 16),
+    ]);
+    map
+}
+
+fn build_lamps(lamps: Option<LampLevel>, sector_light: bool) -> VoxelMap {
+    let options = Options {
+        units_per_voxel: 2,
+        sector_light,
+        open_doors: true,
+        lamps,
+    };
+    VoxelMap::from_map_data(&lamp_map(), palette(), &colormap(), &textures(), &options)
         .unwrap()
 }
 
@@ -425,7 +470,12 @@ fn spawn_is_at_view_height_facing_north() {
 
 #[test]
 fn uniform_in_never_claims_wrongly() {
-    for m in [build(true, false), build(false, true)] {
+    for m in [
+        build(true, false),
+        build(false, true),
+        build_lamps(Some(LampLevel::Full), false),
+        build_lamps(Some(LampLevel::Sector), true),
+    ] {
         let (min, max) = m.bounds();
         let (mut claims, mut interior) = (0, 0);
         let mut rng = 12345u64;
@@ -531,5 +581,132 @@ impl VoxelMap {
     fn shade_test_floor(&self, x: i32, z: i32) -> u8 {
         let s = self.column_sector(x, z).unwrap();
         self.flat_texel(self.sectors[s as usize].floor_flat, x, z)
+    }
+}
+
+#[test]
+fn light_flats_and_walls_glow_only_where_bright() {
+    let m = build_lamps(Some(LampLevel::Full), false);
+    // A's ceiling voxel is 64. Column x's flat u is 2x + 1: bright at x = 0,
+    // dark at x = 1.
+    let z = -10;
+    assert_eq!(
+        m.voxel([0, 64, z]),
+        Voxel::Emissive {
+            index: 250,
+            level: 15
+        }
+    );
+    assert_eq!(m.voxel([1, 64, z]), Voxel::Solid(20));
+    // Only the surface glows: the flat carried on up is plain.
+    assert!(matches!(m.voxel([0, 66, z]), Voxel::Solid(_)));
+    // A's south wall (128,0)→(0,0): row = 128 − centre height. Height 81 is
+    // row 47, in the bright top; height 21 is row 107, dark.
+    let (x, z) = col(21, -1);
+    assert_eq!(
+        m.voxel([x, 40, z]),
+        Voxel::Emissive {
+            index: 240,
+            level: 15
+        }
+    );
+    assert_eq!(m.voxel([x, 10, z]), Voxel::Solid(30));
+    // Behind the wall the texture goes on into the void, plain.
+    assert!(matches!(m.voxel([x, 40, z + 2]), Voxel::Solid(_)));
+
+    // With the sector's level: light 160 is level 10.
+    let m = build_lamps(Some(LampLevel::Sector), true);
+    assert_eq!(
+        m.voxel([0, 64, -10]),
+        Voxel::Emissive {
+            index: 250,
+            level: 10
+        }
+    );
+    // Sector light darkens the dark texel (flat table 12) but not the glow.
+    assert_eq!(m.voxel([1, 64, -10]), Voxel::Solid(20 + 12));
+
+    // Without lamps nothing glows.
+    let m = build_lamps(None, false);
+    assert_eq!(m.voxel([0, 64, -10]), Voxel::Solid(250));
+    assert_eq!(m.voxel([x, 40, z]), Voxel::Solid(240));
+    assert!(m.emissive_materials().is_empty());
+}
+
+#[test]
+fn lamp_things_stand_as_pillars_with_a_glowing_top() {
+    let m = build_lamps(Some(LampLevel::Full), false);
+    // The multiplayer-only torch isn't drawn.
+    assert_eq!(m.pillar_count(), 2);
+    // The tall torch at DOOM (64, 32) is voxel (32, -16): columns 31..33
+    // and -17..-15, from A's floor (voxel 0) 46 voxels up, glowing in the
+    // top 18. The test palette is grey, so the nearest entry to the stand's
+    // (64, 56, 48) is 56 and to red's (240, 60, 20) is 107.
+    let red = Voxel::Emissive {
+        index: 107,
+        level: 15,
+    };
+    for (x, z) in [(31, -17), (32, -17), (31, -16), (32, -16)] {
+        assert_eq!(m.voxel([x, 0, z]), Voxel::Solid(56));
+        assert_eq!(m.voxel([x, 27, z]), Voxel::Solid(56));
+        assert_eq!(m.voxel([x, 28, z]), red);
+        assert_eq!(m.voxel([x, 45, z]), red);
+        assert_eq!(m.voxel([x, 46, z]), Voxel::Air);
+    }
+    for (x, z) in [(30, -16), (33, -16), (32, -18), (32, -15)] {
+        assert_eq!(m.voxel([x, 5, z]), Voxel::Air, "({x}, {z})");
+    }
+    // The floor under it is still the floor.
+    assert!(matches!(m.voxel([31, -1, -17]), Voxel::Solid(_)));
+    // The candle at DOOM (260, 64) stands on D's floor, voxel 8: 8 voxels
+    // high with 3 glowing.
+    assert_eq!(m.voxel([129, 12, -33]), Voxel::Solid(56));
+    assert!(matches!(
+        m.voxel([129, 13, -33]),
+        Voxel::Emissive { level: 15, .. }
+    ));
+    assert_eq!(m.voxel([129, 16, -33]), Voxel::Air);
+
+    let m = build_lamps(None, false);
+    assert_eq!(m.pillar_count(), 0);
+    assert_eq!(m.voxel([31, 0, -17]), Voxel::Air);
+}
+
+#[test]
+fn uniform_in_never_claims_air_around_a_pillar() {
+    let (lo, hi) = ([30, 0, -18], [34, 4, -14]);
+    assert_eq!(
+        build_lamps(None, false).uniform_in(lo, hi),
+        Some(Voxel::Air)
+    );
+    let m = build_lamps(Some(LampLevel::Full), false);
+    assert_eq!(m.uniform_in(lo, hi), None);
+    // Above the torch, the room's air is air again.
+    assert_eq!(m.uniform_in([30, 46, -18], [34, 60, -14]), Some(Voxel::Air));
+}
+
+#[test]
+fn emissive_materials_list_every_glowing_voxel() {
+    for (level, sector_light) in [
+        (LampLevel::Full, false),
+        (LampLevel::Full, true),
+        (LampLevel::Sector, true),
+    ] {
+        let m = build_lamps(Some(level), sector_light);
+        let list = m.emissive_materials();
+        assert!(list.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+        let (min, max) = m.bounds();
+        let mut glowing = 0;
+        for x in min[0]..max[0] {
+            for y in min[1]..max[1] {
+                for z in min[2]..max[2] {
+                    if let Voxel::Emissive { index, level } = m.voxel([x, y, z]) {
+                        glowing += 1;
+                        assert!(list.contains(&(index, level)), "({index}, {level})");
+                    }
+                }
+            }
+        }
+        assert!(glowing > 1000, "{glowing} glowing voxels");
     }
 }

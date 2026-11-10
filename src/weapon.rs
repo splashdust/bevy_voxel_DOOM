@@ -10,6 +10,12 @@
 //!
 //! `--fire N` fires N shots by itself once the world has settled, spread in
 //! a fixed pattern around the view centre.
+//!
+//! In the light modes that propagate light, a shot also flashes: the voxel
+//! just in front of the face it hits, along the face's normal, glows for
+//! `--flash-time` seconds and goes back to air. The ray came through that
+//! voxel, so it is air, and the carve leaves it alone, since it only empties
+//! solid voxels. Rays pass through flashes.
 
 use std::sync::Arc;
 
@@ -20,7 +26,7 @@ use doom_voxelize::{Voxel, VoxelMap};
 
 use crate::camera::FlyCamera;
 use crate::capture::{CaptureSet, WorldSettled};
-use crate::world::DoomWorld;
+use crate::world::{material, DoomWorld};
 
 /// DOOM's chaingun: a shot every 4 tics at 35 tics a second.
 const SHOT_INTERVAL: f32 = 4.0 / 35.0;
@@ -47,6 +53,11 @@ pub struct WeaponPlugin {
     pub range: f32,
     /// Shots to fire once the world has settled.
     pub scripted_shots: u32,
+    /// The material of a shot's flash, in the light modes that propagate
+    /// light.
+    pub flash: Option<u16>,
+    /// Seconds a flash glows.
+    pub flash_time: f32,
 }
 
 #[derive(Resource)]
@@ -55,6 +66,10 @@ struct Weapon {
     radius: i32,
     /// How far a shot reaches, in voxels.
     range: f32,
+    flash: Option<u16>,
+    flash_time: f32,
+    /// Flashes glowing now: where, and seconds left.
+    flashes: Vec<(IVec3, f32)>,
     /// Seconds until the next shot may fire.
     cooldown: f32,
     /// The button went down with the cursor captured and is still down.
@@ -75,11 +90,15 @@ impl Plugin for WeaponPlugin {
             map: Arc::clone(&self.map),
             radius: self.radius,
             range: self.range,
+            flash: self.flash,
+            flash_time: self.flash_time,
+            flashes: Vec::new(),
             cooldown: 0.0,
             trigger_held: false,
         })
         // Before the click that captures the cursor is seen by `grab_cursor`.
-        .add_systems(Update, fire_from_mouse.before(crate::camera::grab_cursor));
+        .add_systems(Update, fire_from_mouse.before(crate::camera::grab_cursor))
+        .add_systems(Update, put_out_flashes);
         if self.scripted_shots > 0 {
             app.insert_resource(ScriptedShots {
                 total: self.scripted_shots,
@@ -124,14 +143,32 @@ fn fire_from_mouse(
     if weapon.cooldown <= 0.0 {
         weapon.cooldown += SHOT_INTERVAL;
         let ray = Ray3d::new(camera.translation, camera.forward());
-        shoot(
-            &mut voxel_world,
-            &weapon.map,
-            ray,
-            weapon.range,
-            weapon.radius,
-        );
+        shoot(&mut voxel_world, &mut weapon, ray);
     }
+}
+
+/// Sets each flash whose time is up back to air, unless something else has
+/// replaced it.
+fn put_out_flashes(
+    time: Res<Time>,
+    mut weapon: ResMut<Weapon>,
+    mut voxel_world: VoxelWorld<DoomWorld>,
+) {
+    if weapon.flashes.is_empty() {
+        return;
+    }
+    let dt = time.delta_secs();
+    let flash = weapon.flash.map(WorldVoxel::Solid);
+    weapon.flashes.retain_mut(|(p, left)| {
+        *left -= dt;
+        if *left > 0.0 {
+            return true;
+        }
+        if Some(voxel_world.get_voxel(*p)) == flash {
+            voxel_world.set_voxel(*p, WorldVoxel::Air);
+        }
+        false
+    });
 }
 
 /// Fires the next scripted shot once the world has settled, one a frame,
@@ -140,7 +177,7 @@ fn fire_scripted(
     mut shots: ResMut<ScriptedShots>,
     mut settled: ResMut<WorldSettled>,
     camera: Single<&Transform, With<FlyCamera>>,
-    weapon: Res<Weapon>,
+    mut weapon: ResMut<Weapon>,
     mut voxel_world: VoxelWorld<DoomWorld>,
 ) {
     if shots.fired >= shots.total || (shots.fired == 0 && !settled.is_settled()) {
@@ -148,8 +185,9 @@ fn fire_scripted(
     }
     if shots.fired == 0 {
         let ray = Ray3d::new(camera.translation, camera.forward());
+        let flash = weapon.flash;
         let distance = voxel_world
-            .raycast(ray, &|(_, voxel)| voxel.is_solid())
+            .raycast(ray, &|(_, voxel)| stops_a_shot(voxel, flash))
             .map_or(SPREAD_FALLBACK_DISTANCE, |hit| {
                 hit.position.distance(camera.translation).max(1.0)
             });
@@ -161,13 +199,7 @@ fn fire_scripted(
     let aim = Quat::from_euler(EulerRot::YXZ, off * turn.cos(), off * turn.sin(), 0.0);
     let direction = Dir3::new(camera.rotation * aim * Vec3::NEG_Z).unwrap_or(Dir3::NEG_Z);
     let ray = Ray3d::new(camera.translation, direction);
-    match shoot(
-        &mut voxel_world,
-        &weapon.map,
-        ray,
-        weapon.range,
-        weapon.radius,
-    ) {
+    match shoot(&mut voxel_world, &mut weapon, ray) {
         Some(hit) => println!("shot {}: hit voxel {hit}", i + 1),
         None => println!("shot {}: missed", i + 1),
     }
@@ -175,18 +207,22 @@ fn fire_scripted(
     settled.unsettle();
 }
 
+/// Whether a shot stops at `voxel`: any solid but a flash.
+fn stops_a_shot(voxel: WorldVoxel<u16>, flash: Option<u16>) -> bool {
+    voxel.is_solid() && voxel != WorldVoxel::Solid(flash.unwrap_or(u16::MAX))
+}
+
 /// Fires along `ray`: carves and scorches around the first solid voxel
-/// within `range` voxels, and returns it.
+/// within the weapon's range, lights a flash in front of it, and returns it.
 fn shoot(
     voxel_world: &mut VoxelWorld<DoomWorld>,
-    map: &Arc<VoxelMap>,
+    weapon: &mut Weapon,
     ray: Ray3d,
-    range: f32,
-    radius: i32,
 ) -> Option<IVec3> {
-    let hit = voxel_world.raycast(ray, &|(_, voxel)| voxel.is_solid())?;
+    let (map, radius, flash) = (Arc::clone(&weapon.map), weapon.radius, weapon.flash);
+    let hit = voxel_world.raycast(ray, &|(_, voxel)| stops_a_shot(voxel, flash))?;
     let centre = hit.voxel_pos();
-    if (centre.as_vec3() + 0.5).distance(ray.origin) > range {
+    if (centre.as_vec3() + 0.5).distance(ray.origin) > weapon.range {
         return None;
     }
     // What's there now: an edit, a published voxel, or what the map makes.
@@ -198,7 +234,7 @@ fn shoot(
         |p| {
             let effect = blast(p - centre, p, radius)?;
             let solid = match current(p) {
-                WorldVoxel::Unset => matches!(map.voxel(p.to_array()), Voxel::Solid(_)),
+                WorldVoxel::Unset => map.voxel(p.to_array()).is_solid(),
                 voxel => voxel.is_solid(),
             };
             if !solid {
@@ -206,15 +242,28 @@ fn shoot(
             }
             match effect {
                 Blast::Carve => Some(WorldVoxel::Air),
+                // A scorched lamp goes out.
                 Blast::Scorch(steps) => match map.voxel(p.to_array()) {
-                    Voxel::Solid(index) => {
-                        Some(WorldVoxel::Solid(map.shade(index, steps)))
+                    Voxel::Solid(index) | Voxel::Emissive { index, .. } => {
+                        Some(WorldVoxel::Solid(material(map.shade(index, steps), 0)))
                     }
                     Voxel::Air => None,
                 },
             }
         },
     );
+    if let (Some(flash), Some(normal)) = (flash, hit.voxel_normal()) {
+        let p = centre + normal;
+        let air = match current(p) {
+            WorldVoxel::Unset => !map.voxel(p.to_array()).is_solid(),
+            voxel => voxel == WorldVoxel::Air,
+        };
+        if air {
+            voxel_world.set_voxel(p, WorldVoxel::Solid(flash));
+            let time = weapon.flash_time;
+            weapon.flashes.push((p, time));
+        }
+    }
     Some(centre)
 }
 

@@ -1,18 +1,24 @@
-//! A small text overlay: map, scale, camera voxel position and frame rate;
-//! and a crosshair at the screen centre.
+//! A small text overlay: map, scale, light mode, camera voxel position, the
+//! propagated light there and frame rate; and a crosshair at the screen
+//! centre.
 
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
 };
 
+use bevy_voxel_world::prelude::*;
+
 use crate::camera::FlyCamera;
+use crate::world::DoomWorld;
 
 /// What the HUD names the map by.
 #[derive(Resource, Clone)]
 pub struct MapLabel {
     pub name: String,
     pub units_per_voxel: i32,
+    /// The light mode's name.
+    pub light: &'static str,
 }
 
 #[derive(Component)]
@@ -69,6 +75,7 @@ pub fn update_hud(
     label: Res<MapLabel>,
     diagnostics: Res<DiagnosticsStore>,
     camera: Single<&Transform, With<FlyCamera>>,
+    voxel_world: VoxelWorld<DoomWorld>,
     mut text: Single<&mut Text, With<HudText>>,
 ) {
     let fps = diagnostics
@@ -76,8 +83,11 @@ pub fn update_hud(
         .and_then(|fps| fps.smoothed())
         .map_or("--".to_string(), |fps| format!("{fps:.0}"));
     let p = camera.translation.floor().as_ivec3();
+    let levels = voxel_world.light_at(p).map_or(String::new(), |l| {
+        format!("  sky {:.0} lamp {:.0}", l.sky, l.voxel)
+    });
     text.0 = format!(
-        "{}  {} u/vox\n{} {} {}  {fps} fps",
-        label.name, label.units_per_voxel, p.x, p.y, p.z
+        "{}  {} u/vox  light {}\n{} {} {}{levels}  {fps} fps",
+        label.name, label.units_per_voxel, label.light, p.x, p.y, p.z
     );
 }

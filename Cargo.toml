@@ -16,7 +16,7 @@ doom_voxelize = { path = "crates/voxelize" }
 bevy = { version = "0.20", default-features = false, features = ["3d", "ui"] }
 # While the experiment lives inside the crate's repo it builds against this
 # checkout. Once broken out, point this at a git rev of the crate instead.
-bevy_voxel_world = { path = "../.." }
+bevy_voxel_world = { path = "../..", features = ["light_propagation"] }
 
 [profile.dev]
 opt-level = 1

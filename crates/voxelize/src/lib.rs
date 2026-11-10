@@ -18,24 +18,43 @@
 //! depth, and are [`INTERIOR`] from [`INTERIOR_DEPTH`] voxels in. See
 //! `build` for the import, `colour` for the texturing rules and `interior`
 //! for the solid's inside.
+//!
+//! With [`Options::lamps`] set, the bright texels of light flats and light
+//! wall textures are [`Voxel::Emissive`], and light-giving things stand as
+//! small pillars with an emissive top: see `lamps`.
 
 use doom_wad::{Palette, Picture, Wad, WadError};
 
 mod build;
 mod colour;
 mod interior;
+mod lamps;
 mod light;
 mod locate;
 mod tiles;
 
 pub use build::sky_texture_name;
 pub use interior::INTERIOR_DEPTH;
+pub use lamps::{LampLevel, LAMP_THINGS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Voxel {
     Air,
     /// A palette index into [`VoxelMap::palette`].
     Solid(u8),
+    /// A solid voxel that gives off light at `level`, from 1 to 15, shown
+    /// in palette colour `index` without sector light. Only with
+    /// [`Options::lamps`].
+    Emissive {
+        index: u8,
+        level: u8,
+    },
+}
+
+impl Voxel {
+    pub fn is_solid(self) -> bool {
+        !matches!(self, Voxel::Air)
+    }
 }
 
 /// The colour of solid voxels deep inside the solid: palette index 0, black.
@@ -50,6 +69,10 @@ pub struct Options {
     pub sector_light: bool,
     /// Bake door sectors open, as if every door had been used.
     pub open_doors: bool,
+    /// Light sources: the bright texels of light flats and wall textures
+    /// glow, and light-giving things stand as pillars. `None` leaves both
+    /// out.
+    pub lamps: Option<LampLevel>,
 }
 
 impl Default for Options {
@@ -58,6 +81,7 @@ impl Default for Options {
             units_per_voxel: 2,
             sector_light: true,
             open_doors: true,
+            lamps: None,
         }
     }
 }
@@ -86,6 +110,8 @@ struct SectorInfo {
     ceiling_flat: u16,
     /// The light table for its flats.
     flat_table: u8,
+    /// The emission level of its glowing flats and walls, 0 for none.
+    lamp_level: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +124,8 @@ struct SideInfo {
     middle: u16,
     /// The light table for its walls.
     table: u8,
+    /// The emission level of its glowing texels, 0 for none.
+    lamp_level: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +167,8 @@ pub struct VoxelMap {
     tiles: tiles::Tiles,
     spawn: ([f32; 3], f32),
     sky: [u8; 3],
+    /// Light sources, empty without [`Options::lamps`].
+    lamps: lamps::Lamps,
 }
 
 impl VoxelMap {
@@ -171,13 +201,13 @@ impl VoxelMap {
                 if line & MASKED != 0 {
                     return self.masked(line & !MASKED, x, y, z);
                 }
-                return Voxel::Air;
+                return self.lamps.pillar(col, y).unwrap_or(Voxel::Air);
             }
             if y == sec.floor_v - 1 {
-                return Voxel::Solid(self.flat(sec.floor_flat, sec.flat_table, x, z));
+                return self.flat(sec.floor_flat, sec, x, z);
             }
             if !sec.sky && y == sec.ceiling_v {
-                return Voxel::Solid(self.flat(sec.ceiling_flat, sec.flat_table, x, z));
+                return self.flat(sec.ceiling_flat, sec, x, z);
             }
         }
         // Air beside a solid voxel is another sector's, so only columns next
@@ -186,7 +216,7 @@ impl VoxelMap {
         if near.dist == 1 {
             for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 if let Some(air) = self.air_sector(x + dx, y, z + dz) {
-                    return Voxel::Solid(self.wall(col, air, p, (dx, dz)));
+                    return self.wall(col, air, p, (dx, dz));
                 }
             }
         }
@@ -200,7 +230,7 @@ impl VoxelMap {
     ///
     /// It says [`INTERIOR`] only when the box grown by `INTERIOR_DEPTH + 1`
     /// on every side holds no surface, since colours reach that far into the
-    /// solid.
+    /// solid, and air only when the box holds no pillar.
     pub fn uniform_in(&self, min: [i32; 3], max: [i32; 3]) -> Option<Voxel> {
         let (bottom, top) = (self.min[1], self.max[1]);
         if min[1] >= top {
@@ -224,7 +254,11 @@ impl VoxelMap {
             return Some(Voxel::Solid(INTERIOR));
         }
         let st = stats(0);
-        if !st.blocked && min[1] >= st.air_lo && max[1] <= st.air_hi {
+        if !st.blocked
+            && min[1] >= st.air_lo
+            && max[1] <= st.air_hi
+            && !self.lamps.pillar_in(min, max)
+        {
             return Some(Voxel::Air);
         }
         None
@@ -250,6 +284,22 @@ impl VoxelMap {
     /// An RGB colour for the sky, for the clear colour.
     pub fn sky_colour(&self) -> [u8; 3] {
         self.sky
+    }
+
+    /// Every emissive material [`voxel`](Self::voxel) can return, as
+    /// `(palette index, level)`, sorted. Empty without [`Options::lamps`].
+    pub fn emissive_materials(&self) -> &[(u8, u8)] {
+        &self.lamps.materials
+    }
+
+    /// The palette entry nearest `rgb`.
+    pub fn nearest_colour(&self, rgb: [u8; 3]) -> u8 {
+        lamps::nearest(&self.palette, rgb)
+    }
+
+    /// How many light-giving things stand as pillars.
+    pub fn pillar_count(&self) -> usize {
+        self.lamps.pillars.len()
     }
 
     /// Map units per voxel.

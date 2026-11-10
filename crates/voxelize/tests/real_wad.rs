@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use doom_voxelize::{Options, Voxel, VoxelMap, INTERIOR_DEPTH};
+use doom_voxelize::{LampLevel, Options, Voxel, VoxelMap, INTERIOR_DEPTH};
 use doom_wad::{MapData, Wad};
 
 fn wad() -> Option<Wad> {
@@ -332,4 +332,56 @@ fn every_map_builds() {
         );
     }
     println!("slowest: {} at {:.3} s", slowest.1, slowest.0);
+}
+
+/// With lamps on, every chunk box `uniform_in` calls uniform agrees with
+/// `voxel`, pillars included, and every glowing voxel of the mixed chunks
+/// is in the emissive list.
+#[test]
+fn lamps_agree_with_uniform_in_and_the_emissive_list() {
+    let Some(wad) = wad() else { return };
+    let name = first_map(&wad);
+    let options = Options {
+        lamps: Some(LampLevel::Full),
+        ..Options::default()
+    };
+    let m = VoxelMap::build(&wad, &name, &options).unwrap();
+    let list = m.emissive_materials();
+    let (min, max) = m.bounds();
+    let (mut claims, mut glowing, mut pillar_boxes) = (0, 0u64, 0);
+    for cz in min[2].div_euclid(32)..=max[2].div_euclid(32) {
+        for cy in min[1].div_euclid(32)..=max[1].div_euclid(32) {
+            for cx in min[0].div_euclid(32)..=max[0].div_euclid(32) {
+                let lo = [cx * 32 - 1, cy * 32 - 1, cz * 32 - 1];
+                let hi = lo.map(|v| v + 34);
+                let uniform = m.uniform_in(lo, hi);
+                claims += uniform.is_some() as u32;
+                let mut has_pillar = false;
+                for x in lo[0]..hi[0] {
+                    for y in lo[1]..hi[1] {
+                        for z in lo[2]..hi[2] {
+                            let v = m.voxel([x, y, z]);
+                            if let Some(u) = uniform {
+                                assert_eq!(v, u, "{lo:?}..{hi:?} at {x},{y},{z}");
+                            }
+                            if let Voxel::Emissive { index, level } = v {
+                                glowing += 1;
+                                assert!(list.contains(&(index, level)));
+                                has_pillar |= level == 15
+                                    && m.column_air(x, z)
+                                        .is_some_and(|(f, c)| (f..c).contains(&y));
+                            }
+                        }
+                    }
+                }
+                pillar_boxes += has_pillar as u32;
+            }
+        }
+    }
+    println!(
+        "{name}: {} pillars, {} emissive materials, {glowing} glowing voxels, {claims} uniform chunks, {pillar_boxes} chunks with a flame",
+        m.pillar_count(),
+        list.len()
+    );
+    assert!(glowing > 0);
 }

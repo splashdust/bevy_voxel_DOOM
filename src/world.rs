@@ -1,10 +1,12 @@
 //! The voxel world: a `VoxelWorldConfig` over a `VoxelMap`, and the palette
-//! material that shows each voxel's palette colour flat and unlit.
+//! material that shows each voxel's palette colour flat and unlit, times
+//! propagated light in the light modes that use it.
 
 use std::sync::Arc;
 
 use bevy::{
     asset::uuid_handle,
+    camera::Exposure,
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey},
     prelude::*,
@@ -20,10 +22,14 @@ use bevy_voxel_world::{
 };
 use doom_voxelize::{Voxel, VoxelMap};
 
+use crate::args::{LightKnobs, LightMode};
+
 /// How far chunks spawn, in DOOM map units: a long DOOM sightline.
 const VIEW_DISTANCE_UNITS: i32 = 2048;
 
-/// The voxel world of one DOOM map. Its material index is the palette index.
+/// The voxel world of one DOOM map. Its material index holds the palette
+/// index in its low byte and, for an emissive voxel, the level it gives off
+/// light at in bits 8 to 11: see [`material`].
 ///
 /// `Default` is only there because the crate's config trait needs it: the
 /// world is always built with a map.
@@ -31,6 +37,24 @@ const VIEW_DISTANCE_UNITS: i32 = 2048;
 pub struct DoomWorld {
     map: Option<Arc<VoxelMap>>,
     spawning_distance: u32,
+    /// `Some` in the light modes that propagate light.
+    light: Option<LightPropagation>,
+    /// The map's emissive materials and the shot flash's, with light on.
+    emissive: Vec<(u16, Emission)>,
+}
+
+/// The palette colour of the shot flash: a hot yellow white.
+const FLASH_RGB: [u8; 3] = [255, 236, 160];
+
+/// The material of a shot's flash in `map`'s palette, glowing at level 15.
+pub fn flash_material(map: &VoxelMap) -> u16 {
+    material(map.nearest_colour(FLASH_RGB), 15)
+}
+
+/// The material index of a voxel of palette colour `index`, giving off light
+/// at `level`, 0 for none.
+pub fn material(index: u8, level: u8) -> u16 {
+    index as u16 | ((level as u16 & 15) << 8)
 }
 
 /// The spawning distance in chunks: `VIEW_DISTANCE_UNITS`, and at least 8.
@@ -45,23 +69,96 @@ pub fn view_distance_voxels(units_per_voxel: i32) -> f32 {
 }
 
 impl DoomWorld {
-    pub fn new(map: Arc<VoxelMap>, units_per_voxel: i32) -> Self {
+    pub fn new(
+        map: Arc<VoxelMap>,
+        units_per_voxel: i32,
+        mode: LightMode,
+        knobs: &LightKnobs,
+    ) -> Self {
+        let flash = flash_material(&map);
+        let light = mode.propagated().then(|| light_settings(&map, knobs));
+        let emissive = if light.is_some() {
+            map.emissive_materials()
+                .iter()
+                .map(|&(index, level)| {
+                    (material(index, level), Emission::level(level as f32))
+                })
+                .chain([(flash, Emission::level(15.0))])
+                .collect()
+        } else {
+            Vec::new()
+        };
         DoomWorld {
             map: Some(map),
             spawning_distance: spawning_distance(units_per_voxel),
+            light,
+            emissive,
         }
     }
 }
 
-fn world_voxel(voxel: Voxel) -> WorldVoxel<u8> {
+/// The light settings of `map` under `knobs`.
+///
+/// Sky light enters a column that holds no solid voxel up to the map's top,
+/// above which everything is air: the sky sectors' air runs up to it, and
+/// every other column is solid above its ceiling up to it, so indoor rooms
+/// get no direct sky. The palette shader is unlit and adds voxel light to
+/// sky light, so voxel light at level 15 is made to read as brightness
+/// `lamp_gain` at the camera's default exposure, which the shader caps at 1.
+fn light_settings(map: &VoxelMap, knobs: &LightKnobs) -> LightPropagation {
+    let (_, max) = map.bounds();
+    let curve = falloff_curve(knobs.falloff);
+    LightPropagation {
+        sky: Sky::Ceiling { y: max[1] },
+        sky_reach: knobs.sky_reach,
+        voxel_reach: knobs.voxel_reach,
+        sky_fill: knobs.sky_fill.then(SkyFill::default),
+        slot_capacity: SLOT_CAPACITY,
+        look: LightLook {
+            smoothing: if knobs.stepped {
+                LightSmoothing::Stepped
+            } else {
+                LightSmoothing::Smoothed
+            },
+            sky_falloff: curve.clone(),
+            voxel_falloff: curve,
+            voxel_brightness: knobs.lamp_gain / Exposure::default().exposure(),
+            minimum_brightness: knobs.min_light,
+            ..default()
+        },
+        ..default()
+    }
+}
+
+/// Each level `base` times as bright as the one above, shifted and scaled so
+/// level 15 is 1 and level 0 is 0.
+///
+/// The crate shows level 0 black whatever the curve says, so a plain
+/// `LevelCurve::exponential` with a base near 1 ends light's reach in a hard
+/// step from level 1's brightness to black, which reads as a sharp-edged
+/// pool. This one fades into it.
+fn falloff_curve(base: f32) -> LevelCurve {
+    if base >= 0.999 {
+        return LevelCurve::linear();
+    }
+    let floor = base.powi(15);
+    LevelCurve::from_fn(|level| (base.powi(15 - level as i32) - floor) / (1.0 - floor))
+}
+
+/// Light texture slots: a long DOOM sightline loads thousands of mixed
+/// chunks, far more than the crate's default of 1,024.
+const SLOT_CAPACITY: u32 = 4096;
+
+fn world_voxel(voxel: Voxel) -> WorldVoxel<u16> {
     match voxel {
         Voxel::Air => WorldVoxel::Air,
-        Voxel::Solid(index) => WorldVoxel::Solid(index),
+        Voxel::Solid(index) => WorldVoxel::Solid(material(index, 0)),
+        Voxel::Emissive { index, level } => WorldVoxel::Solid(material(index, level)),
     }
 }
 
 impl VoxelWorldConfig for DoomWorld {
-    type MaterialIndex = u8;
+    type MaterialIndex = u16;
     type ChunkUserBundle = ();
 
     fn spawning_distance(&self) -> u32 {
@@ -73,7 +170,7 @@ impl VoxelWorldConfig for DoomWorld {
         ChunkDespawnStrategy::FarAway
     }
 
-    fn chunk_fill_hint(&self, key: ChunkKey) -> FillHint<u8> {
+    fn chunk_fill_hint(&self, key: ChunkKey) -> FillHint<u16> {
         let Some(map) = &self.map else {
             return FillHint::Unknown;
         };
@@ -85,7 +182,7 @@ impl VoxelWorldConfig for DoomWorld {
         }
     }
 
-    fn voxel_lookup_delegate(&self) -> VoxelLookupDelegate<u8> {
+    fn voxel_lookup_delegate(&self) -> VoxelLookupDelegate<u16> {
         let map = self.map.clone().expect("the world is built with a map");
         Box::new(move |chunk_position, lod_level, _previous| {
             // The chunk's voxels and the one-voxel padding the mesher samples.
@@ -102,8 +199,16 @@ impl VoxelWorldConfig for DoomWorld {
         })
     }
 
-    fn texture_index_mapper(&self) -> Arc<dyn Fn(u8) -> [u32; 3] + Send + Sync> {
-        Arc::new(|index| [index as u32; 3])
+    fn texture_index_mapper(&self) -> Arc<dyn Fn(u16) -> [u32; 3] + Send + Sync> {
+        Arc::new(|material| [(material & 0xff) as u32; 3])
+    }
+
+    fn light_propagation(&self) -> Option<LightPropagation> {
+        self.light.clone()
+    }
+
+    fn emissive_materials(&self) -> Vec<(u16, Emission)> {
+        self.emissive.clone()
     }
 }
 
@@ -111,7 +216,10 @@ const PALETTE_SHADER: Handle<Shader> =
     uuid_handle!("6d1f0a52-3c47-4e8b-9a61-0f2b7d94c3e5");
 
 /// Shows each voxel in its palette colour, times the mesher's ambient
-/// occlusion, with no lighting.
+/// occlusion, with no PBR lighting. In a lit world the crate wraps it in
+/// `VoxelWorldMaterial<PaletteMaterial>`, whose extension calls this
+/// `specialize` first and adds the `VOXEL_LIGHT` shader def, under which the
+/// shader scales the colour by the face's propagated light.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 pub struct PaletteMaterial {
     /// The palette in linear RGB, so the sRGB output is the palette's bytes.
@@ -167,6 +275,8 @@ impl Material for PaletteMaterial {
 pub struct DoomWorldPlugin {
     pub map: Arc<VoxelMap>,
     pub units_per_voxel: i32,
+    pub light: LightMode,
+    pub knobs: LightKnobs,
 }
 
 impl Plugin for DoomWorldPlugin {
@@ -184,8 +294,35 @@ impl Plugin for DoomWorldPlugin {
                 VoxelWorldPlugin::with_config(DoomWorld::new(
                     Arc::clone(&self.map),
                     self.units_per_voxel,
+                    self.light,
+                    &self.knobs,
                 ))
                 .with_material(PaletteMaterial::new(self.map.palette())),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_falloff_runs_from_black_to_full_without_a_step() {
+        for base in [0.7, 0.9, 1.0] {
+            let curve = falloff_curve(base);
+            assert!(curve.at(0.01) < 0.01, "{base}");
+            assert!((curve.at(15.0) - 1.0).abs() < 1e-6, "{base}");
+            for level in 1..15 {
+                let (a, b) = (curve.at(level as f32), curve.at(level as f32 + 1.0));
+                assert!(a < b, "{base} at {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn materials_hold_the_palette_index_and_the_level() {
+        assert_eq!(material(200, 0), 200);
+        assert_eq!(material(200, 15), 200 | 15 << 8);
+        assert_eq!(material(7, 15) & 0xff, 7);
     }
 }

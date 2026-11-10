@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use bevy::prelude::*;
+use doom_voxelize::LampLevel;
 
 pub const USAGE: &str = "\
 doom_voxels: a vanilla DOOM map as a bevy_voxel_world voxel world
@@ -13,7 +14,20 @@ usage: doom_voxels --wad PATH [options]
   --map NAME              the map to show, like E1M1 or MAP01; the WAD's first map by default
   --list-maps             print the WAD's maps and exit
   --units-per-voxel N     DOOM map units per voxel (default 2)
-  --no-sector-light       full-bright colours instead of DOOM's sector light
+  --light MODE            sector (default): DOOM's sector light baked in, no propagation;
+                          propagated: full-bright colours times propagated light;
+                          both: sector light baked in, times propagated light;
+                          flat: full-bright, no light at all
+  --min-light B           propagated light's least brightness, 0 to 1 (default 0.08)
+  --falloff BASE          each light level is BASE times as bright as the one above (default 0.9)
+  --sky-reach N           voxels sky light spreads past where it falls, 1 to 32 (default 32)
+  --voxel-reach N         voxels a lamp's light spreads, 1 to 32 (default 32)
+  --lamp-gain G           lamp light at level 15 as a brightness, before the cap at 1 (default 1.5)
+  --sky-fill on|off       carry sky light through openings into rooms (default on)
+  --lamp-level full|sector
+                          light surfaces glow at level 15, or at their sector's level (default full)
+  --stepped               show each voxel's light as a flat step instead of smoothing it
+  --flash-time S          how long a shot's flash glows, in seconds (default 0.12)
   --closed-doors          keep door sectors closed
   --pos X,Y,Z             start the camera here, in voxel coordinates
   --yaw DEG               start yaw, 0 facing DOOM's north, positive turning left
@@ -22,6 +36,7 @@ usage: doom_voxels --wad PATH [options]
   --fire N                fire N shots around the view centre once the world is ready
   --screenshot PATH       wait for the world around the camera to finish, save a PNG, exit
   --quit-after S          exit after S seconds
+  --no-vsync              don't wait for the display, so the HUD's frame rate shows the cost
   --help                  this text";
 
 #[derive(Resource, Clone, Debug)]
@@ -30,7 +45,8 @@ pub struct Args {
     pub map: Option<String>,
     pub list_maps: bool,
     pub units_per_voxel: i32,
-    pub sector_light: bool,
+    pub light: LightMode,
+    pub knobs: LightKnobs,
     pub closed_doors: bool,
     pub pos: Option<Vec3>,
     /// Degrees.
@@ -41,6 +57,82 @@ pub struct Args {
     pub fire: u32,
     pub screenshot: Option<PathBuf>,
     pub quit_after: Option<f32>,
+    pub no_vsync: bool,
+}
+
+/// How the map is lit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightMode {
+    /// DOOM's sector light baked into the colours, no propagation.
+    Sector,
+    /// Full-bright colours times propagated light.
+    Propagated,
+    /// Sector light baked in, times propagated light.
+    Both,
+    /// Full-bright colours, no light at all.
+    Flat,
+}
+
+impl LightMode {
+    fn parse(text: &str) -> Option<LightMode> {
+        Some(match text {
+            "sector" => LightMode::Sector,
+            "propagated" => LightMode::Propagated,
+            "both" => LightMode::Both,
+            "flat" => LightMode::Flat,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LightMode::Sector => "sector",
+            LightMode::Propagated => "propagated",
+            LightMode::Both => "both",
+            LightMode::Flat => "flat",
+        }
+    }
+
+    /// Whether DOOM's sector light is baked into the colours.
+    pub fn sector_light(self) -> bool {
+        matches!(self, LightMode::Sector | LightMode::Both)
+    }
+
+    /// Whether the world propagates light, with lamps and flashes.
+    pub fn propagated(self) -> bool {
+        matches!(self, LightMode::Propagated | LightMode::Both)
+    }
+}
+
+/// The settings of propagated light the command line can change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightKnobs {
+    pub min_light: f32,
+    pub falloff: f32,
+    pub sky_reach: u8,
+    pub voxel_reach: u8,
+    pub lamp_gain: f32,
+    pub sky_fill: bool,
+    pub lamp_level: LampLevel,
+    pub stepped: bool,
+    /// Seconds.
+    pub flash_time: f32,
+}
+
+impl Default for LightKnobs {
+    fn default() -> Self {
+        LightKnobs {
+            min_light: 0.08,
+            falloff: 0.9,
+            sky_reach: 32,
+            voxel_reach: 32,
+            lamp_gain: 1.5,
+            sky_fill: true,
+            lamp_level: LampLevel::Full,
+            stepped: false,
+            flash_time: 0.12,
+        }
+    }
 }
 
 /// Parses the process arguments, printing an error and exiting on bad input.
@@ -69,7 +161,8 @@ fn parse_from(
         map: None,
         list_maps: false,
         units_per_voxel: 2,
-        sector_light: true,
+        light: LightMode::Sector,
+        knobs: LightKnobs::default(),
         closed_doors: false,
         pos: None,
         yaw: None,
@@ -78,13 +171,15 @@ fn parse_from(
         fire: 0,
         screenshot: None,
         quit_after: None,
+        no_vsync: false,
     };
     let mut words = words.into_iter();
     while let Some(word) = words.next() {
         match word.as_str() {
             "--help" | "-h" => return Err(String::new()),
             "--list-maps" => args.list_maps = true,
-            "--no-sector-light" => args.sector_light = false,
+            "--stepped" => args.knobs.stepped = true,
+            "--no-vsync" => args.no_vsync = true,
             "--closed-doors" => args.closed_doors = true,
             _ => {
                 let value = words
@@ -116,6 +211,59 @@ fn parse_from(
                         args.fire = value
                             .parse()
                             .map_err(|_| format!("{word} needs a whole number"))?
+                    }
+                    "--light" => {
+                        args.light = LightMode::parse(&value).ok_or_else(|| {
+                            format!("{word} needs sector, propagated, both or flat, not {value:?}")
+                        })?
+                    }
+                    "--min-light" => {
+                        args.knobs.min_light = Some(number("a brightness")?)
+                            .filter(|b| (0.0..=1.0).contains(b))
+                            .ok_or_else(|| format!("{word} needs a brightness from 0 to 1"))?
+                    }
+                    "--falloff" => {
+                        args.knobs.falloff = Some(number("a base")?)
+                            .filter(|b| *b > 0.0 && *b <= 1.0)
+                            .ok_or_else(|| format!("{word} needs a base above 0, up to 1"))?
+                    }
+                    "--sky-reach" | "--voxel-reach" => {
+                        let reach = value
+                            .parse()
+                            .ok()
+                            .filter(|n: &u8| (1..=32).contains(n))
+                            .ok_or_else(|| format!("{word} needs a whole number from 1 to 32"))?;
+                        if word == "--sky-reach" {
+                            args.knobs.sky_reach = reach;
+                        } else {
+                            args.knobs.voxel_reach = reach;
+                        }
+                    }
+                    "--lamp-gain" => {
+                        args.knobs.lamp_gain = Some(number("a gain")?)
+                            .filter(|g| *g >= 0.0)
+                            .ok_or_else(|| format!("{word} needs a gain, at least 0"))?
+                    }
+                    "--sky-fill" => {
+                        args.knobs.sky_fill = match value.as_str() {
+                            "on" => true,
+                            "off" => false,
+                            _ => return Err(format!("{word} needs on or off, not {value:?}")),
+                        }
+                    }
+                    "--lamp-level" => {
+                        args.knobs.lamp_level = match value.as_str() {
+                            "full" => LampLevel::Full,
+                            "sector" => LampLevel::Sector,
+                            _ => {
+                                return Err(format!("{word} needs full or sector, not {value:?}"))
+                            }
+                        }
+                    }
+                    "--flash-time" => {
+                        args.knobs.flash_time = Some(number("seconds")?)
+                            .filter(|s| *s >= 0.0)
+                            .ok_or_else(|| format!("{word} needs seconds, at least 0"))?
                     }
                     "--pos" => args.pos = Some(parse_vec3(&value)?),
                     "--yaw" => args.yaw = Some(number("degrees")?),
@@ -176,6 +324,66 @@ mod tests {
         );
         let missing = parse(&[], None).unwrap_err();
         assert!(missing.contains("--wad") && missing.contains("DOOM_WAD"));
+    }
+
+    #[test]
+    fn light_flags() {
+        let args = parse(&[], Some("a.wad")).unwrap();
+        assert_eq!(args.light, LightMode::Sector);
+        assert_eq!(args.knobs, LightKnobs::default());
+        for (mode, sector, propagated) in [
+            ("sector", true, false),
+            ("propagated", false, true),
+            ("both", true, true),
+            ("flat", false, false),
+        ] {
+            let args = parse(&["--light", mode], Some("a.wad")).unwrap();
+            assert_eq!(args.light.name(), mode);
+            assert_eq!(args.light.sector_light(), sector, "{mode}");
+            assert_eq!(args.light.propagated(), propagated, "{mode}");
+        }
+        let args = parse(
+            &[
+                "--min-light",
+                "0.1",
+                "--falloff",
+                "0.9",
+                "--sky-reach",
+                "20",
+                "--voxel-reach",
+                "12",
+                "--lamp-gain",
+                "3",
+                "--sky-fill",
+                "off",
+                "--lamp-level",
+                "sector",
+                "--stepped",
+                "--flash-time",
+                "5",
+            ],
+            Some("a.wad"),
+        )
+        .unwrap();
+        let knobs = args.knobs;
+        assert_eq!((knobs.min_light, knobs.falloff), (0.1, 0.9));
+        assert_eq!((knobs.sky_reach, knobs.voxel_reach), (20, 12));
+        assert_eq!(knobs.lamp_gain, 3.0);
+        assert!(!knobs.sky_fill && knobs.stepped);
+        assert_eq!(knobs.lamp_level, LampLevel::Sector);
+        assert_eq!(knobs.flash_time, 5.0);
+        for bad in [
+            &["--light", "dark"][..],
+            &["--min-light", "2"],
+            &["--falloff", "0"],
+            &["--sky-reach", "33"],
+            &["--voxel-reach", "0"],
+            &["--sky-fill", "maybe"],
+            &["--lamp-level", "7"],
+            &["--no-sector-light"],
+        ] {
+            assert!(parse(bad, Some("a.wad")).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

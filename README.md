@@ -4,7 +4,8 @@ An experiment: vanilla DOOM maps from a WAD file, shown as a
 [`bevy_voxel_world`](https://github.com/splashdust/bevy_voxel_world) voxel
 world you can fly through. Every voxel is one colour from DOOM's palette, with
 DOOM's sector light baked in, drawn flat and unlit so the map reads as it does
-in DOOM.
+in DOOM. With `--light propagated` the crate's light propagation lights it
+instead, from the sky and from DOOM's light fixtures.
 
 The workspace has three parts:
 
@@ -50,14 +51,24 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--map NAME` | the map, like `E1M1` or `MAP01`; the WAD's first map by default |
 | `--list-maps` | print the WAD's maps and exit |
 | `--units-per-voxel N` | DOOM map units per voxel, 2 by default |
-| `--no-sector-light` | full-bright colours instead of DOOM's sector light |
+| `--light MODE` | `sector` (default): DOOM's sector light baked in, no propagation. `propagated`: full-bright colours times propagated light. `both`: sector light baked in, times propagated light. `flat`: full-bright, no light at all |
+| `--min-light B` | the least brightness propagated light leaves, from 0 to 1, 0.08 by default |
+| `--falloff BASE` | each light level is `BASE` times as bright as the one above, 0.9 by default; 1 is linear |
+| `--sky-reach N` | how many voxels sky light spreads past where it falls, 1 to 32, 32 by default |
+| `--voxel-reach N` | how many voxels a lamp's light spreads, 1 to 32, 32 by default |
+| `--lamp-gain G` | how bright lamp light is at level 15, before the cap at full brightness, 1.5 by default |
+| `--sky-fill on\|off` | carry sky light through openings into the rooms beside the sky, on by default |
+| `--lamp-level full\|sector` | light flats and walls glow at level 15, or at their sector's light level / 16 |
+| `--stepped` | show each voxel's light as a flat step instead of smoothing it |
+| `--flash-time S` | how long a shot's flash glows, 0.12 s by default. A long time keeps flashes on for a screenshot |
+| `--no-vsync` | don't wait for the display, so the HUD's frame rate shows what a frame costs |
 | `--closed-doors` | keep door sectors closed; they are baked open by default |
 | `--pos X,Y,Z` | start the camera here, in voxels, instead of at player 1's start |
 | `--yaw DEG` | start yaw: 0 faces DOOM's north, positive turns left |
 | `--pitch DEG` | start pitch, positive looks up |
 | `--blast-radius R` | the radius in voxels of the ball a shot carves, 4 by default |
 | `--fire N` | once the world is ready, fire N shots in a small spiral around the view centre |
-| `--screenshot PATH` | wait until the world in view has been generated and meshed, save a PNG and exit. With `--fire`, it waits for the carved chunks too |
+| `--screenshot PATH` | wait until the world in view has been generated and meshed, and its light has settled, save a PNG and exit. With `--fire`, it waits for the carved chunks too |
 | `--quit-after S` | exit after S seconds |
 
 At start it prints how long building the voxel map took and the map's voxel
@@ -74,15 +85,43 @@ its north is −z.
   units and despawn only when far away, so turning round doesn't rebuild the
   room behind you. There is no LOD: a coarse level samples every second voxel
   and would lose one-voxel walls.
-- **Colour.** The material index is the palette index. The texture index
-  mapper passes it on, and a custom material (`PaletteMaterial`, with the
-  crate's vertex shader and `src/palette.wesl` as fragment shader) looks it up
-  in a 256-colour uniform built from the map's palette at runtime. The colour
-  is multiplied by the mesher's ambient occlusion and nothing else. The camera
-  has no tonemapping or dithering, so the window shows the palette's bytes.
+- **Colour.** The material index is a `u16`: the palette index in its low
+  byte and, for a voxel that gives off light, its level in bits 8 to 11. The
+  texture index mapper passes the palette index on, and a custom material
+  (`PaletteMaterial`, with the crate's vertex shader and `src/palette.wesl` as
+  fragment shader) looks it up in a 256-colour uniform built from the map's
+  palette at runtime. The colour is multiplied by the mesher's ambient
+  occlusion and, in the light modes that propagate light, by the face's
+  light. The camera has no tonemapping or dithering, so the window shows the
+  palette's bytes.
+- **Light.** In `propagated` and `both` the world turns on the crate's light
+  propagation, and the crate wraps `PaletteMaterial` in its light bindings.
+  The shader stays unlit: it scales the colour by the face's sky light, the
+  lamp light around it and its own glow if it is a lamp, capped at full
+  brightness and floored at `--min-light`. Sky light enters columns with no
+  solid up to the map top, so it falls into sky sectors only: every other
+  column is solid from its ceiling up to the top. Sky fill carries it on
+  through windows and doors into the rooms beside the sky. What glows, all
+  worked out at import:
+  - the bright texels of DOOM's light flats (`CEIL1_2`, `TLITE6_4`,
+    `FLOOR1_7` and the rest) and of wall textures whose name holds `LITE`,
+    or `BRICKLIT`. Bright means at least 85% of the brightest texel of its
+    texture, so a strip light glows and its frame doesn't;
+  - light-giving things (candles, candelabras, torches, tech lamps, floor
+    lamps, burning barrels), each a 2×2-voxel pillar about its sprite's
+    height, a plain stand under a top in the sprite's colour that glows.
+    Nothing else of things is drawn.
+
+  A glowing voxel keeps its full-bright palette colour in `both` too, since
+  a lamp dimmed by its own sector reads as off. Every source glows at level
+  15 by default: light reaches only 32 voxels at most, a fraction of a DOOM
+  room, and a lower level only shortens that. `--lamp-level sector` ties
+  light flats and walls to their sector's level instead. A shot also lights
+  a flash: the voxel in front of the face it hits glows for `--flash-time`
+  and goes back to air.
 - **Screenshots.** `--screenshot` waits until every spawned chunk has been
-  ready for 60 frames in a row with no chunk spawning or despawning, or two
-  minutes at most. `--fire` waits for the same signal before its first shot,
+  ready, and `VoxelWorld::light_is_settled` true, for 60 frames in a row with
+  no chunk spawning or despawning, or two minutes at most. `--fire` waits for the same signal before its first shot,
   and each shot starts the count again.
 - **The weapon.** A shot is a ray from the camera along its forward vector,
   through `VoxelWorld::raycast`, out to the view distance. Around the voxel
@@ -90,7 +129,8 @@ its north is −z.
   each voxel's position, and darkens solid voxels in a shell 1.5 voxels
   thick outside it by a few COLORMAP tables. The darkening starts from the
   colour `VoxelMap::voxel` gives, so shooting the same spot again doesn't
-  darken it further. Air is never made solid. The scripted shots of
+  darken it further, and a scorched lamp goes out. Air is never made solid,
+  except for a shot's flash, which rays pass through. The scripted shots of
   `--fire` are spread so the craters sit side by side at the distance the
   centre ray hits.
 - **The voxelizer** (`crates/voxelize`). At import every voxel column gets its
@@ -121,7 +161,23 @@ its north is −z.
   DOOM would paint sky above them.
 - Animated flats and textures, and switches, show their first frame.
 - Doors, lifts and crushers don't move.
-- No things: monsters, items and decorations aren't shown.
+- No things: monsters, items and decorations aren't shown, except the
+  pillars that stand in for light-giving things in the light modes.
+- Propagated light is white: a red torch lights its alcove white. And it
+  reaches 32 voxels at most, 64 map units at 2 units per voxel, so a lamp
+  lights a pool beside it and most of a big room stays at `--min-light`.
+  `--units-per-voxel 4` doubles the reach in map units at the cost of
+  detail.
+- `both` multiplies two darkenings, so DOOM's dim rooms come out darker
+  than in either `sector` or `propagated`.
+- DOOM's light effects (flickering, glowing, strobing sectors) don't
+  happen, and sector light levels play no part in `propagated` beyond
+  `--lamp-level sector`.
+- Pillars stand where the thing's centre is, cut off by walls and ceilings,
+  and don't block shots any differently from walls.
+- With the camera close to a wall only a few chunks spawn, and the light
+  beside a lamp in the next chunk can read black until more of the room
+  spawns, though `light_is_settled` says it has settled.
 - No collision: the camera only flies.
 - With `--closed-doors`, the bottom face of a closed door shows the ceiling
   flat instead of the door texture.
@@ -158,6 +214,31 @@ bevy_voxel_world = { path = "../bevy_voxel_world" }
 
 The experiment is partly a dogfooding exercise for the crate. What it had to
 work around:
+
+- **Turning light on for a custom material just worked.** The crate wraps
+  `PaletteMaterial` in `VoxelWorldMaterial<PaletteMaterial>`, calls its
+  `specialize` first, so the vertex layout and the prepass check carry over,
+  and the shader only needed `sample_light`, `sky_brightness` and
+  `voxel_brightness` under `VOXEL_LIGHT`.
+- **The light module's brightness is made for PBR.** `voxel_brightness`
+  multiplies by the look's `voxel_brightness` and the view's exposure, as
+  light added to Bevy's emissive channel needs. An unlit shader that wants
+  level 15 to read as 1 has to set `voxel_brightness` to one over the
+  camera's exposure.
+- **Level 0 is always black,** whatever the curve says. With a gentle
+  `LevelCurve::exponential`, level 1 is still fairly bright, so the end of
+  light's reach shows as a sharp-edged pool. The app builds its own curve,
+  shifted to reach 0 at level 0.
+- **Emission is per material, from a list.** Saying which voxels glow takes
+  a material index wide enough to hold an emissive bit and a level, and a
+  list of every emissive material a lookup can return, worked out at import.
+  The light task searches that list for each solid voxel whose material
+  differs from the one before it, and DOOM's textures change material at
+  almost every voxel, so the list has to stay short: it holds only the
+  palette colours that can glow. A function from material to emission, or a
+  table, would suit a world like this better.
+- **Light is one colour and reaches 32 voxels.** Torches can't tint their
+  light, and at DOOM's scale no lamp can light a room.
 
 - **Per-voxel colour known only at runtime.** `voxel_texture` takes an asset
   path, and the palette comes from the WAD. The way through is a custom

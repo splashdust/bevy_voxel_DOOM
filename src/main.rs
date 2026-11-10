@@ -12,7 +12,7 @@ mod world;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, prelude::*};
+use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, prelude::*, window::PresentMode};
 use doom_voxelize::{Options, VoxelMap};
 use doom_wad::Wad;
 
@@ -53,8 +53,9 @@ fn main() -> AppExit {
 
     let options = Options {
         units_per_voxel: args.units_per_voxel,
-        sector_light: args.sector_light,
+        sector_light: args.light.sector_light(),
         open_doors: !args.closed_doors,
+        lamps: args.light.propagated().then_some(args.knobs.lamp_level),
     };
     let started = Instant::now();
     let map = VoxelMap::build(&wad, &map_name, &options).unwrap_or_else(|e| {
@@ -71,6 +72,14 @@ fn main() -> AppExit {
         max[1] - min[1],
         max[2] - min[2],
     );
+    if args.light.propagated() {
+        println!(
+            "light {}: {} lamp pillars, {} emissive materials",
+            args.light.name(),
+            map.pillar_count(),
+            map.emissive_materials().len()
+        );
+    }
 
     let (spawn, spawn_yaw) = map.spawn();
     let map = Arc::new(map);
@@ -83,12 +92,18 @@ fn main() -> AppExit {
     };
     let [r, g, b] = map.sky_colour();
     let capturing = args.screenshot.is_some();
+    let flash = args.light.propagated().then(|| world::flash_material(&map));
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("doom_voxels: {map_name}"),
             resolution: (1280, 800).into(),
+            present_mode: if args.no_vsync {
+                PresentMode::AutoNoVsync
+            } else {
+                PresentMode::AutoVsync
+            },
             ..default()
         }),
         primary_cursor_options: Some(camera::captured(!capturing)),
@@ -98,6 +113,8 @@ fn main() -> AppExit {
     .add_plugins(DoomWorldPlugin {
         map: Arc::clone(&map),
         units_per_voxel: args.units_per_voxel,
+        light: args.light,
+        knobs: args.knobs.clone(),
     })
     .add_plugins(capture::CapturePlugin {
         screenshot: args.screenshot.clone(),
@@ -109,12 +126,15 @@ fn main() -> AppExit {
         radius: args.blast_radius,
         range: world::view_distance_voxels(args.units_per_voxel),
         scripted_shots: args.fire,
+        flash,
+        flash_time: args.knobs.flash_time,
     })
     .insert_resource(ClearColor(Color::srgb_u8(r, g, b)))
     .insert_resource(start)
     .insert_resource(MapLabel {
         name: map_name,
         units_per_voxel: args.units_per_voxel,
+        light: args.light.name(),
     })
     .add_systems(
         Startup,
