@@ -1980,7 +1980,9 @@ dependencies = [
 
 [[package]]
 name = "bevy_voxel_world"
-version = "0.19.2"
+version = "0.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "789b12e0b1f19fd378199670fe38dc4f110158b6a9c1a5dc6d016c2275e45ca0"
 dependencies = [
  "ahash",
  "bevy",

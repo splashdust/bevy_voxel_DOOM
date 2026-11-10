@@ -5,8 +5,6 @@ edition = "2021"
 publish = false
 description = "An experiment: vanilla DOOM maps from a WAD file as a bevy_voxel_world voxel world"
 
-# Its own workspace, so the experiment builds apart from the crate around it
-# and can move to a repo of its own unchanged.
 [workspace]
 members = ["crates/wad", "crates/voxelize"]
 
@@ -14,9 +12,9 @@ members = ["crates/wad", "crates/voxelize"]
 doom_wad = { path = "crates/wad" }
 doom_voxelize = { path = "crates/voxelize" }
 bevy = { version = "0.20", default-features = false, features = ["3d", "ui", "bevy_audio", "wav"] }
-# While the experiment lives inside the crate's repo it builds against this
-# checkout. Once broken out, point this at a git rev of the crate instead.
-bevy_voxel_world = { path = "../..", features = ["light_propagation"] }
+# For a local checkout of the crate, see "Which bevy_voxel_world" in the
+# README.
+bevy_voxel_world = { version = "0.19.3", features = ["light_propagation"] }
 # Physics for the debris a shot throws out.
 avian3d = { version = "0.8", default-features = false, features = ["3d", "parry-f32", "parallel"] }
 

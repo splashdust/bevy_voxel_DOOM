@@ -418,24 +418,22 @@ its north is −z.
 
 ## Which bevy_voxel_world
 
-While the experiment lives in the crate's repository, at
-`experiments/doom_voxels`, it builds against that checkout by path:
+The experiment builds against the released crate from crates.io:
 
 ```toml
-bevy_voxel_world = { path = "../.." }
+bevy_voxel_world = { version = "0.19.3", features = ["light_propagation"] }
 ```
 
-After breaking it out into a repo of its own, point it at a commit of the
-crate instead:
+To try a branch of the crate, point it at a commit instead:
 
 ```toml
-bevy_voxel_world = { git = "https://github.com/splashdust/bevy_voxel_world", rev = "<commit>" }
+bevy_voxel_world = { git = "https://github.com/splashdust/bevy_voxel_world", rev = "<commit>", features = ["light_propagation"] }
 ```
 
-and to keep working against a local checkout, patch it:
+and to work against a local checkout next to this one, patch it:
 
 ```toml
-[patch."https://github.com/splashdust/bevy_voxel_world"]
+[patch.crates-io]
 bevy_voxel_world = { path = "../bevy_voxel_world" }
 ```
 
