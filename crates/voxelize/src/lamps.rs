@@ -120,6 +120,8 @@ pub(crate) struct Pillar {
     top: i32,
     flame_index: u8,
     stand_index: u8,
+    /// The stand's sector glow level, 0 for none.
+    stand_glow: u8,
 }
 
 const NO_PILLAR: u32 = u32::MAX;
@@ -168,6 +170,11 @@ impl Lamps {
                 index: p.flame_index,
                 level: 15,
             })
+        } else if p.stand_glow > 0 {
+            Some(Voxel::Emissive {
+                index: p.stand_index,
+                level: p.stand_glow,
+            })
         } else {
             Some(Voxel::Solid(p.stand_index))
         }
@@ -187,16 +194,22 @@ impl Lamps {
 
     /// The light sources of `vm`, whose flat and wall ids name `flat_names`
     /// and `wall_names`, and whose sectors and sides already hold their
-    /// lamp levels. `level` is `None` without lamps.
+    /// lamp and glow levels. `level` is `None` without lamps; with
+    /// `sector_glow`, the list also holds every glowing surface's material.
     pub fn build(
         vm: &VoxelMap,
         map: &MapData,
         flat_names: &[String],
         wall_names: &[String],
         level: Option<LampLevel>,
+        sector_glow: bool,
     ) -> Lamps {
         if level.is_none() {
-            return Lamps::default();
+            let mut lamps = Lamps::default();
+            if sector_glow {
+                lamps.materials = lamps.list_materials(vm);
+            }
+            return lamps;
         }
         let brightness: Vec<u8> = vm
             .palette
@@ -275,6 +288,7 @@ impl Lamps {
                 top,
                 flame_index: nearest(&vm.palette, kind.flame_rgb),
                 stand_index: vm.tables[sec.flat_table as usize][stand as usize],
+                stand_glow: sec.flat_glow,
             });
         }
         if self.pillars.is_empty() {
@@ -306,12 +320,17 @@ impl Lamps {
                 (0..=255u8).filter(|&i| seen[i as usize]).collect()
             };
         let flat_bright: Vec<Vec<u8>> = (0..vm.flats.len())
-            .map(|id| bright(self.flat_glow[id], &mut vm.flats[id].iter().copied()))
+            .map(|id| {
+                bright(
+                    self.flat_glow.get(id).copied().flatten(),
+                    &mut vm.flats[id].iter().copied(),
+                )
+            })
             .collect();
         let wall_bright: Vec<Vec<u8>> = (0..vm.walls.len())
             .map(|id| {
                 bright(
-                    self.wall_glow[id],
+                    self.wall_glow.get(id).copied().flatten(),
                     &mut vm.walls[id].pixels.iter().flatten().copied(),
                 )
             })
@@ -336,7 +355,57 @@ impl Lamps {
         }
         for p in &self.pillars {
             found.insert((p.flame_index, 15));
+            if p.stand_glow > 0 {
+                found.insert((p.stand_index, p.stand_glow));
+            }
         }
+        // Sector glow: every texel of every surface, in the light table it
+        // is drawn in. Lamp texels are listed at both levels, which costs a
+        // little list length and nothing else.
+        let mut add_glow = |texels: &mut dyn Iterator<Item = u8>, table: u8, glow: u8| {
+            if glow == 0 {
+                return;
+            }
+            let mut seen = [false; 256];
+            for texel in texels {
+                seen[vm.tables[table as usize][texel as usize] as usize] = true;
+            }
+            for index in (0..=255u8).filter(|&i| seen[i as usize]) {
+                found.insert((index, glow));
+            }
+        };
+        for sec in &vm.sectors {
+            let mut flats = vec![sec.floor_flat];
+            if !sec.sky {
+                flats.push(sec.ceiling_flat);
+            }
+            for flat in flats {
+                // A missing flat shows the fallback grey.
+                match vm.flats.get(flat as usize) {
+                    Some(flat) => {
+                        add_glow(&mut flat.iter().copied(), sec.flat_table, sec.flat_glow)
+                    }
+                    None => add_glow(
+                        &mut std::iter::once(crate::colour::FALLBACK),
+                        sec.flat_table,
+                        sec.flat_glow,
+                    ),
+                }
+            }
+        }
+        for side in vm.line_info.iter().flat_map(|l| l.sides.iter().flatten()) {
+            for tex in [side.upper, side.lower, side.middle] {
+                if let Some(wall) = vm.walls.get(tex as usize) {
+                    add_glow(
+                        &mut wall.pixels.iter().flatten().copied(),
+                        side.table,
+                        side.glow,
+                    );
+                }
+            }
+        }
+        // A wall with no texture shows the floor flat of the sector it faces,
+        // listed above with that sector's level.
         found.into_iter().collect()
     }
 }

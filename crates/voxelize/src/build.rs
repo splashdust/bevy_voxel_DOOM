@@ -92,6 +92,14 @@ impl VoxelMap {
             map.sectors.iter().map(|s| s.ceiling as i32).collect()
         };
         let table = |t: u8| if options.sector_light { t + 1 } else { 0 };
+        let glow_levels = light::GlowLevels::measure(&palette, colormap);
+        let glow = |t: u8| {
+            if options.sector_glow {
+                glow_levels.of(t)
+            } else {
+                0
+            }
+        };
         let mut sectors: Vec<SectorInfo> = map
             .sectors
             .iter()
@@ -107,6 +115,7 @@ impl VoxelMap {
                 ceiling_flat: flat_ids.id(&sec.ceiling_flat, &textures.flats),
                 flat_table: table(light::flat_table(sec.light)),
                 lamp_level: lamps::sector_level(options.lamps, sec.light),
+                flat_glow: glow(light::flat_table(sec.light)),
             })
             .collect();
         // A sector with its ceiling below its floor has no air.
@@ -167,6 +176,10 @@ impl VoxelMap {
                             options.lamps,
                             map.sectors[sd.sector as usize].light,
                         ),
+                        glow: glow(light::wall_table(
+                            map.sectors[sd.sector as usize].light,
+                            contrast,
+                        )),
                     })
                 });
                 let a = map.vertexes[l.v1 as usize];
@@ -222,13 +235,20 @@ impl VoxelMap {
             spawn: ([0.0; 3], 0.0),
             sky: [90, 110, 140],
             lamps: Lamps::default(),
+            glow: glow_levels.clone(),
         };
         vm.lines = vm.line_grid(map);
         vm.near = vm.near_grid();
         vm.tiles = vm.tile_stats();
         vm.spawn = vm.find_spawn(map, &locator);
-        vm.lamps =
-            Lamps::build(&vm, map, &flat_ids.order, &wall_ids.order, options.lamps);
+        vm.lamps = Lamps::build(
+            &vm,
+            map,
+            &flat_ids.order,
+            &wall_ids.order,
+            options.lamps,
+            options.sector_glow,
+        );
         if let Some(sky) = textures.walls.get(sky_texture_name(&map.name)) {
             vm.sky = average_colour(sky, &vm.palette).unwrap_or(vm.sky);
         }

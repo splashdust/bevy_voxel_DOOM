@@ -334,18 +334,25 @@ fn every_map_builds() {
     println!("slowest: {} at {:.3} s", slowest.1, slowest.0);
 }
 
-/// With lamps on, every chunk box `uniform_in` calls uniform agrees with
-/// `voxel`, pillars included, and every glowing voxel of the mixed chunks
-/// is in the emissive list.
+/// With lamps on, and with sector glow too, every chunk box `uniform_in`
+/// calls uniform agrees with `voxel`, pillars included, and every glowing
+/// voxel of the mixed chunks is in the emissive list.
 #[test]
 fn lamps_agree_with_uniform_in_and_the_emissive_list() {
     let Some(wad) = wad() else { return };
     let name = first_map(&wad);
-    let options = Options {
-        lamps: Some(LampLevel::Full),
-        ..Options::default()
-    };
-    let m = VoxelMap::build(&wad, &name, &options).unwrap();
+    for sector_glow in [false, true] {
+        let options = Options {
+            lamps: Some(LampLevel::Full),
+            sector_light: !sector_glow,
+            sector_glow,
+            ..Options::default()
+        };
+        check_lamps(&VoxelMap::build(&wad, &name, &options).unwrap(), &name);
+    }
+}
+
+fn check_lamps(m: &VoxelMap, name: &str) {
     let list = m.emissive_materials();
     let (min, max) = m.bounds();
     let (mut claims, mut glowing, mut pillar_boxes) = (0, 0u64, 0);
@@ -379,7 +386,8 @@ fn lamps_agree_with_uniform_in_and_the_emissive_list() {
         }
     }
     println!(
-        "{name}: {} pillars, {} emissive materials, {glowing} glowing voxels, {claims} uniform chunks, {pillar_boxes} chunks with a flame",
+        "{name}: glow brightness {:?}, {} pillars, {} emissive materials, {glowing} glowing voxels, {claims} uniform chunks, {pillar_boxes} chunks with level-15 glow in the air",
+        m.glow_brightness(),
         m.pillar_count(),
         list.len()
     );

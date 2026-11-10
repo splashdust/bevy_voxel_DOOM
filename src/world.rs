@@ -6,12 +6,11 @@ use std::sync::Arc;
 
 use bevy::{
     asset::uuid_handle,
-    camera::Exposure,
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey},
     prelude::*,
     render::render_resource::{
-        AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+        AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
     },
     shader::{ShaderDefVal, ShaderRef},
 };
@@ -76,7 +75,7 @@ impl DoomWorld {
         knobs: &LightKnobs,
     ) -> Self {
         let flash = flash_material(&map);
-        let light = mode.propagated().then(|| light_settings(&map, knobs));
+        let light = mode.propagated().then(|| light_settings(&map, mode, knobs));
         let emissive = if light.is_some() {
             map.emissive_materials()
                 .iter()
@@ -97,22 +96,43 @@ impl DoomWorld {
     }
 }
 
-/// The light settings of `map` under `knobs`.
+/// The light settings of `map` in `mode` under `knobs`.
 ///
 /// Sky light enters a column that holds no solid voxel up to the map's top,
 /// above which everything is air: the sky sectors' air runs up to it, and
 /// every other column is solid above its ceiling up to it, so indoor rooms
-/// get no direct sky. The palette shader is unlit and adds voxel light to
-/// sky light, so voxel light at level 15 is made to read as brightness
-/// `lamp_gain` at the camera's default exposure, which the shader caps at 1.
-fn light_settings(map: &VoxelMap, knobs: &LightKnobs) -> LightPropagation {
+/// get no direct sky.
+///
+/// The palette shader is unlit and reads the look's curves, not its voxel
+/// brightness: see [`ShaderLight`]. In sector glow, voxel light follows the
+/// brightness the voxelizer measured from COLORMAP for each level, as a share
+/// of sRGB value, so a face lit by its own surface shows its sector's light.
+fn light_settings(
+    map: &VoxelMap,
+    mode: LightMode,
+    knobs: &LightKnobs,
+) -> LightPropagation {
     let (_, max) = map.bounds();
     let curve = falloff_curve(knobs.falloff);
+    let voxel_curve = if mode.sector_glow() {
+        LevelCurve::from_table(map.glow_brightness())
+    } else {
+        curve.clone()
+    };
     LightPropagation {
-        sky: Sky::Ceiling { y: max[1] },
+        sky: if knobs.sky(mode) {
+            Sky::Ceiling { y: max[1] }
+        } else {
+            Sky::Off
+        },
         sky_reach: knobs.sky_reach,
-        voxel_reach: knobs.voxel_reach,
+        voxel_reach: knobs.voxel_reach(mode),
         sky_fill: knobs.sky_fill.then(SkyFill::default),
+        precision: if knobs.steps_256(mode) {
+            LightPrecision::Steps256
+        } else {
+            LightPrecision::Steps16
+        },
         slot_capacity: SLOT_CAPACITY,
         look: LightLook {
             smoothing: if knobs.stepped {
@@ -120,10 +140,9 @@ fn light_settings(map: &VoxelMap, knobs: &LightKnobs) -> LightPropagation {
             } else {
                 LightSmoothing::Smoothed
             },
-            sky_falloff: curve.clone(),
-            voxel_falloff: curve,
-            voxel_brightness: knobs.lamp_gain / Exposure::default().exposure(),
-            minimum_brightness: knobs.min_light,
+            sky_falloff: curve,
+            voxel_falloff: voxel_curve,
+            minimum_brightness: knobs.min_light(mode),
             ..default()
         },
         ..default()
@@ -225,11 +244,45 @@ pub struct PaletteMaterial {
     /// The palette in linear RGB, so the sRGB output is the palette's bytes.
     #[uniform(0)]
     palette: [Vec4; 256],
+    /// How the shader turns light into brightness, in a lit world.
+    #[uniform(1)]
+    light: ShaderLight,
+}
+
+/// What the palette shader needs beyond the crate's look: lamp light at
+/// level 15 shows as brightness `lamp_gain`, a face whose own voxel gives off
+/// light at `glow_from` or more glows as a lamp's, and with `in_srgb` at 1 the
+/// brightness scales the colour's sRGB value rather than its linear one.
+///
+/// Sector glow scales in sRGB because COLORMAP does: a table leaves dark and
+/// bright colours at about the same share of their sRGB value, where the same
+/// linear factor darkens a dark colour's sRGB value far more than a bright
+/// one's, and DOOM's textures are mostly dark.
+///
+/// In sector glow every surface gives off light, so only real lamps, at
+/// level 15, may glow: a sector surface glowing would show its full-bright
+/// colour instead of the light in front of it. Elsewhere any lamp glows.
+#[derive(Clone, Copy, Debug, ShaderType)]
+pub struct ShaderLight {
+    pub lamp_gain: f32,
+    pub glow_from: f32,
+    pub in_srgb: f32,
+}
+
+impl ShaderLight {
+    pub fn new(mode: LightMode, knobs: &LightKnobs) -> Self {
+        ShaderLight {
+            lamp_gain: knobs.lamp_gain(mode),
+            glow_from: if mode.sector_glow() { 14.5 } else { 0.5 },
+            in_srgb: if mode.sector_glow() { 1.0 } else { 0.0 },
+        }
+    }
 }
 
 impl PaletteMaterial {
-    pub fn new(palette: &[[u8; 3]; 256]) -> Self {
+    pub fn new(palette: &[[u8; 3]; 256], light: ShaderLight) -> Self {
         PaletteMaterial {
+            light,
             palette: palette
                 .map(|[r, g, b]| Color::srgb_u8(r, g, b).to_linear().to_vec4()),
         }
@@ -297,7 +350,10 @@ impl Plugin for DoomWorldPlugin {
                     self.light,
                     &self.knobs,
                 ))
-                .with_material(PaletteMaterial::new(self.map.palette())),
+                .with_material(PaletteMaterial::new(
+                    self.map.palette(),
+                    ShaderLight::new(self.light, &self.knobs),
+                )),
             );
     }
 }

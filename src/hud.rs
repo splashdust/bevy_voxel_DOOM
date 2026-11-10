@@ -84,7 +84,7 @@ pub fn update_hud(
         .map_or("--".to_string(), |fps| format!("{fps:.0}"));
     let p = camera.translation.floor().as_ivec3();
     let levels = voxel_world.light_at(p).map_or(String::new(), |l| {
-        format!("  sky {:.0} lamp {:.0}", l.sky, l.voxel)
+        format!("  sky {:.1} lamp {:.1}", l.sky, l.voxel)
     });
     text.0 = format!(
         "{}  {} u/vox  light {}\n{} {} {}{levels}  {fps} fps",

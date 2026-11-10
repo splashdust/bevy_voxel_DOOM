@@ -56,6 +56,7 @@ fn main() -> AppExit {
         sector_light: args.light.sector_light(),
         open_doors: !args.closed_doors,
         lamps: args.light.propagated().then_some(args.knobs.lamp_level),
+        sector_glow: args.light.sector_glow(),
     };
     let started = Instant::now();
     let map = VoxelMap::build(&wad, &map_name, &options).unwrap_or_else(|e| {

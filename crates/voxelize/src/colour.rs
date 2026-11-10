@@ -14,8 +14,19 @@ pub(crate) struct WallTexel {
     pub texel: u8,
     /// The light table.
     pub table: u8,
-    /// The emission level when the texel glows, else 0.
+    /// The emission level when the texel is a lamp's, else 0.
     pub lamp: u8,
+    /// The sector glow level of the side it is seen from, 0 for none.
+    pub glow: u8,
+}
+
+/// `index`, glowing at `level` if it isn't 0.
+fn glowing(index: u8, level: u8) -> Voxel {
+    if level > 0 {
+        Voxel::Emissive { index, level }
+    } else {
+        Voxel::Solid(index)
+    }
 }
 
 impl VoxelMap {
@@ -31,7 +42,7 @@ impl VoxelMap {
 
     /// The voxel of a flat of sector `sec` above or below voxel column
     /// `(x, z)`: emissive where it is a bright texel of a light flat, and
-    /// otherwise solid in the sector's light.
+    /// otherwise in the sector's light, glowing at its sector glow level.
     pub(crate) fn flat(&self, flat: u16, sec: &SectorInfo, x: i32, z: i32) -> Voxel {
         let texel = self.flat_texel(flat, x, z);
         if sec.lamp_level > 0 && self.lamps.flat_glows(flat, texel) {
@@ -40,7 +51,10 @@ impl VoxelMap {
                 level: sec.lamp_level,
             };
         }
-        Voxel::Solid(self.tables[sec.flat_table as usize][texel as usize])
+        glowing(
+            self.tables[sec.flat_table as usize][texel as usize],
+            sec.flat_glow,
+        )
     }
 
     /// A flat's texel above or below voxel column `(x, z)`, unlit. Flats
@@ -75,7 +89,7 @@ impl VoxelMap {
                 level: w.lamp,
             };
         }
-        Voxel::Solid(self.tables[w.table as usize][w.texel as usize])
+        glowing(self.tables[w.table as usize][w.texel as usize], w.glow)
     }
 
     /// The unlit texel and light table of the wall of linedef `line` at
@@ -95,6 +109,7 @@ impl VoxelMap {
             texel: self.flat_texel(air_sec.floor_flat, x + dx, z + dz),
             table: air_sec.flat_table,
             lamp: 0,
+            glow: air_sec.flat_glow,
         };
         if line == NO_LINE {
             return fallback;
@@ -173,6 +188,7 @@ impl VoxelMap {
                 } else {
                     0
                 },
+                glow: side.glow,
             },
             None => fallback,
         }
@@ -209,7 +225,7 @@ impl VoxelMap {
             return Voxel::Air;
         }
         match self.wall_texel(li, side, d, side.middle, top, px, py, h) {
-            Some(t) => Voxel::Solid(self.tables[side.table as usize][t as usize]),
+            Some(t) => glowing(self.tables[side.table as usize][t as usize], side.glow),
             None => Voxel::Air,
         }
     }

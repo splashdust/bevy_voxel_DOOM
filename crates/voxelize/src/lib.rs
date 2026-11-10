@@ -21,7 +21,9 @@
 //!
 //! With [`Options::lamps`] set, the bright texels of light flats and light
 //! wall textures are [`Voxel::Emissive`], and light-giving things stand as
-//! small pillars with an emissive top: see `lamps`.
+//! small pillars with an emissive top: see `lamps`. With
+//! [`Options::sector_glow`], every surface voxel also glows at a level that
+//! stands for its sector's light: see `light::GlowLevels`.
 
 use doom_wad::{Palette, Picture, Wad, WadError};
 
@@ -73,6 +75,11 @@ pub struct Options {
     /// glow, and light-giving things stand as pillars. `None` leaves both
     /// out.
     pub lamps: Option<LampLevel>,
+    /// Every solid voxel beside air glows at a level standing for the light
+    /// DOOM would draw it in: its sector's light through the floor, ceiling
+    /// or wall table, measured against COLORMAP (see `light::GlowLevels`).
+    /// Lamps keep level 15, and voxels inside the solid don't glow.
+    pub sector_glow: bool,
 }
 
 impl Default for Options {
@@ -82,6 +89,7 @@ impl Default for Options {
             sector_light: true,
             open_doors: true,
             lamps: None,
+            sector_glow: false,
         }
     }
 }
@@ -112,6 +120,8 @@ struct SectorInfo {
     flat_table: u8,
     /// The emission level of its glowing flats and walls, 0 for none.
     lamp_level: u8,
+    /// With sector glow, the level its floor and ceiling glow at; else 0.
+    flat_glow: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +136,8 @@ struct SideInfo {
     table: u8,
     /// The emission level of its glowing texels, 0 for none.
     lamp_level: u8,
+    /// With sector glow, the level its walls glow at; else 0.
+    glow: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +181,8 @@ pub struct VoxelMap {
     sky: [u8; 3],
     /// Light sources, empty without [`Options::lamps`].
     lamps: lamps::Lamps,
+    /// Sector glow's levels, measured from COLORMAP.
+    glow: light::GlowLevels,
 }
 
 impl VoxelMap {
@@ -295,6 +309,14 @@ impl VoxelMap {
     /// The palette entry nearest `rgb`.
     pub fn nearest_colour(&self, rgb: [u8; 3]) -> u8 {
         lamps::nearest(&self.palette, rgb)
+    }
+
+    /// With [`Options::sector_glow`], the share of its sRGB value a face
+    /// reading each light level from 0 to 15 should show to look as DOOM
+    /// draws it: a face beside a surface glowing at level `E` reads `E − 1`
+    /// at a voxel reach of 14.
+    pub fn glow_brightness(&self) -> [f32; 16] {
+        self.glow.brightness
     }
 
     /// How many light-giving things stand as pillars.

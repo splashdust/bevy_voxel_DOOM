@@ -18,6 +18,7 @@
 //! solid voxels. Rays pass through flashes.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bevy::window::PrimaryWindow;
 use bevy::{prelude::*, window::CursorGrabMode, window::CursorOptions};
@@ -70,6 +71,9 @@ struct Weapon {
     flash_time: f32,
     /// Flashes glowing now: where, and seconds left.
     flashes: Vec<(IVec3, f32)>,
+    /// Since the last shot whose light hasn't landed: when it fired, frames
+    /// since, and the longest frame since, in seconds.
+    landing: Option<(Instant, u32, f32)>,
     /// Seconds until the next shot may fire.
     cooldown: f32,
     /// The button went down with the cursor captured and is still down.
@@ -93,12 +97,14 @@ impl Plugin for WeaponPlugin {
             flash: self.flash,
             flash_time: self.flash_time,
             flashes: Vec::new(),
+            landing: None,
             cooldown: 0.0,
             trigger_held: false,
         })
         // Before the click that captures the cursor is seen by `grab_cursor`.
         .add_systems(Update, fire_from_mouse.before(crate::camera::grab_cursor))
-        .add_systems(Update, put_out_flashes);
+        .add_systems(Update, put_out_flashes)
+        .add_systems(Last, report_landing);
         if self.scripted_shots > 0 {
             app.insert_resource(ScriptedShots {
                 total: self.scripted_shots,
@@ -207,6 +213,31 @@ fn fire_scripted(
     settled.unsettle();
 }
 
+/// Prints how long the light of the last shot took to land, in a world that
+/// propagates light: from the shot until `light_is_settled`, which waits for
+/// the remeshed chunks' light too. Another shot before then restarts it.
+fn report_landing(
+    time: Res<Time<Real>>,
+    mut weapon: ResMut<Weapon>,
+    voxel_world: VoxelWorld<DoomWorld>,
+) {
+    let lit = weapon.flash.is_some();
+    let Some((fired, frames, longest)) = weapon.landing.as_mut() else {
+        return;
+    };
+    *frames += 1;
+    *longest = longest.max(time.delta_secs());
+    if !lit || !voxel_world.light_is_settled() {
+        return;
+    }
+    println!(
+        "shot light landed after {:.1} ms, {frames} frames; longest frame {:.1} ms",
+        fired.elapsed().as_secs_f64() * 1000.0,
+        *longest * 1000.0
+    );
+    weapon.landing = None;
+}
+
 /// Whether a shot stops at `voxel`: any solid but a flash.
 fn stops_a_shot(voxel: WorldVoxel<u16>, flash: Option<u16>) -> bool {
     voxel.is_solid() && voxel != WorldVoxel::Solid(flash.unwrap_or(u16::MAX))
@@ -221,6 +252,7 @@ fn shoot(
 ) -> Option<IVec3> {
     let (map, radius, flash) = (Arc::clone(&weapon.map), weapon.radius, weapon.flash);
     let hit = voxel_world.raycast(ray, &|(_, voxel)| stops_a_shot(voxel, flash))?;
+    weapon.landing = Some((Instant::now(), 0, 0.0));
     let centre = hit.voxel_pos();
     if (centre.as_vec3() + 0.5).distance(ray.origin) > weapon.range {
         return None;

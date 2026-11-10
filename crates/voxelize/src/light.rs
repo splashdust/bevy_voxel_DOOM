@@ -47,9 +47,105 @@ pub(crate) fn flat_table(lightlevel: u16) -> u8 {
     (startmap(level(lightlevel)) - scale / 2).clamp(0, NUMCOLORMAPS - 1) as u8
 }
 
+/// The glow levels of sector glow: for each COLORMAP table, the level a
+/// surface drawn in it glows at, and for each light level the brightness a
+/// face reading it shows, so that a face lit only by its own surface looks
+/// as bright as DOOM draws it.
+///
+/// Light loses one level per voxel at a voxel reach of 14, so the open voxel
+/// in front of a surface glowing at `E` holds `E − 1`: a table's level is one
+/// more than the light level its face reads.
+///
+/// COLORMAP darkens nearly in proportion in sRGB: table `k` leaves a colour
+/// at about `1 − k/32` of its sRGB value, whether the colour is dark or
+/// bright. So each table is measured as the mean ratio of sRGB luma with and
+/// without it over the palette's entries that aren't near black, and a
+/// brightness here is such a ratio, for the shader to multiply in sRGB.
+/// Levels are spaced evenly in it, and a level's brightness is the mean of
+/// the tables that read it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlowLevels {
+    /// Per COLORMAP table, the level a surface glows at, from 1 to 15.
+    pub level: [u8; 32],
+    /// Per light level, the share of its sRGB value a face reading it shows.
+    pub brightness: [f32; 16],
+}
+
+/// The highest level a face lit by its own surface reads.
+const TOP_READ: f32 = 14.0;
+
+/// Palette entries darker than this sRGB luma, out of 255, are left out of
+/// the measure: COLORMAP rounds them to black or near it.
+const DARKEST_MEASURED: f32 = 20.0;
+
+impl GlowLevels {
+    pub fn measure(palette: &[[u8; 3]; 256], colormap: &doom_wad::Colormap) -> Self {
+        let luma = |[r, g, b]: [u8; 3]| {
+            0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+        };
+        let measured: Vec<usize> = (0..256)
+            .filter(|&i| luma(palette[i]) > DARKEST_MEASURED)
+            .collect();
+        let mut level = [1u8; 32];
+        let mut sums = [(0.0f32, 0u32); 16];
+        for (k, out) in level.iter_mut().enumerate() {
+            let ratio = match colormap.tables.get(k) {
+                Some(table) if !measured.is_empty() => {
+                    let sum: f32 = measured
+                        .iter()
+                        .map(|&i| luma(palette[table[i] as usize]) / luma(palette[i]))
+                        .sum();
+                    (sum / measured.len() as f32).min(1.0)
+                }
+                _ => 1.0,
+            };
+            let read = (TOP_READ * ratio).round() as usize;
+            *out = read as u8 + 1;
+            sums[read].0 += ratio;
+            sums[read].1 += 1;
+        }
+        let brightness = std::array::from_fn(|read| match (read, sums[read]) {
+            (0, _) => 0.0,
+            (_, (sum, n)) if n > 0 => sum / n as f32,
+            _ => (read as f32 / TOP_READ).min(1.0),
+        });
+        GlowLevels { level, brightness }
+    }
+
+    /// The level a surface drawn in COLORMAP table `table` glows at.
+    pub fn of(&self, table: u8) -> u8 {
+        self.level[(table as usize).min(31)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glow_levels_follow_how_much_each_table_darkens() {
+        // A grey palette and tables that scale each entry's value by
+        // (32 − k) / 32.
+        let palette: [[u8; 3]; 256] = std::array::from_fn(|i| [i as u8; 3]);
+        let tables = (0..34)
+            .map(|k| std::array::from_fn(|i| (i as u32 * (32 - k.min(32)) / 32) as u8))
+            .collect();
+        let glow = GlowLevels::measure(&palette, &doom_wad::Colormap { tables });
+        assert_eq!(glow.of(0), 15);
+        assert!(
+            glow.level.windows(2).all(|w| w[0] >= w[1]),
+            "{:?}",
+            glow.level
+        );
+        assert!(glow.of(31) <= 2);
+        // Dark tables still get levels of their own.
+        let distinct = glow.level.iter().collect::<std::collections::BTreeSet<_>>();
+        assert!(distinct.len() >= 12, "{:?}", glow.level);
+        assert_eq!(glow.brightness[0], 0.0);
+        // Level 14 holds the brightest tables, 0 and its neighbours.
+        assert!(glow.brightness[14] > 0.9 && glow.brightness[14] <= 1.0);
+        assert!(glow.brightness.windows(2).all(|w| w[0] <= w[1]));
+    }
 
     #[test]
     fn full_light_is_the_brightest_table_and_dark_sectors_darken() {

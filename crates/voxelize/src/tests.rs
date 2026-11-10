@@ -281,6 +281,7 @@ fn build(open_doors: bool, sector_light: bool) -> VoxelMap {
         sector_light,
         open_doors,
         lamps: None,
+        sector_glow: false,
     };
     VoxelMap::from_map_data(&test_map(), palette(), &colormap(), &textures(), &options)
         .unwrap()
@@ -315,9 +316,44 @@ fn build_lamps(lamps: Option<LampLevel>, sector_light: bool) -> VoxelMap {
         sector_light,
         open_doors: true,
         lamps,
+        sector_glow: false,
     };
     VoxelMap::from_map_data(&lamp_map(), palette(), &colormap(), &textures(), &options)
         .unwrap()
+}
+
+/// Tables that scale each grey entry by (32 − k) / 32, so each darkens as
+/// COLORMAP does and sector glow's levels differ between them.
+fn darkening_colormap() -> Colormap {
+    let tables = (0..34u32)
+        .map(|k| std::array::from_fn(|i| (i as u32 * (32 - k.min(32)) / 32) as u8))
+        .collect();
+    Colormap { tables }
+}
+
+/// The lamp map with sector glow and full-bright colours, as the app's
+/// `sector-glow` mode builds it.
+fn build_glow(lamps: Option<LampLevel>) -> VoxelMap {
+    let options = Options {
+        units_per_voxel: 2,
+        sector_light: false,
+        open_doors: true,
+        lamps,
+        sector_glow: true,
+    };
+    VoxelMap::from_map_data(
+        &lamp_map(),
+        palette(),
+        &darkening_colormap(),
+        &textures(),
+        &options,
+    )
+    .unwrap()
+}
+
+/// The level a surface drawn in COLORMAP table `k` glows at in `build_glow`.
+fn glow_of(k: u8) -> u8 {
+    crate::light::GlowLevels::measure(&palette(), &darkening_colormap()).of(k)
 }
 
 /// Column x for DOOM x, z for DOOM y, at 2 units per voxel.
@@ -475,6 +511,8 @@ fn uniform_in_never_claims_wrongly() {
         build(false, true),
         build_lamps(Some(LampLevel::Full), false),
         build_lamps(Some(LampLevel::Sector), true),
+        build_glow(Some(LampLevel::Full)),
+        build_glow(None),
     ] {
         let (min, max) = m.bounds();
         let (mut claims, mut interior) = (0, 0);
@@ -687,12 +725,14 @@ fn uniform_in_never_claims_air_around_a_pillar() {
 
 #[test]
 fn emissive_materials_list_every_glowing_voxel() {
-    for (level, sector_light) in [
-        (LampLevel::Full, false),
-        (LampLevel::Full, true),
-        (LampLevel::Sector, true),
-    ] {
-        let m = build_lamps(Some(level), sector_light);
+    let maps = [
+        build_lamps(Some(LampLevel::Full), false),
+        build_lamps(Some(LampLevel::Full), true),
+        build_lamps(Some(LampLevel::Sector), true),
+        build_glow(Some(LampLevel::Full)),
+        build_glow(None),
+    ];
+    for m in maps {
         let list = m.emissive_materials();
         assert!(list.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
         let (min, max) = m.bounds();
@@ -709,4 +749,87 @@ fn emissive_materials_list_every_glowing_voxel() {
         }
         assert!(glowing > 1000, "{glowing} glowing voxels");
     }
+}
+
+#[test]
+fn surfaces_glow_at_the_level_of_the_table_they_are_drawn_in() {
+    let m = build_glow(Some(LampLevel::Full));
+    // Light 160: flats use table 12, walls along x table 14 and walls along
+    // y table 6, as `sector_light_passes_through_colormap` checks.
+    let (flat, along_x, along_y) = (glow_of(12), glow_of(14), glow_of(6));
+    assert!(
+        along_x < flat && flat < along_y,
+        "{along_x} {flat} {along_y}"
+    );
+    // Room A's floor, full-bright, glowing at the flat level.
+    let (x, z) = col(65, 65);
+    assert_eq!(
+        m.voxel([x, -1, z]),
+        Voxel::Emissive {
+            index: 1 + 64,
+            level: flat
+        }
+    );
+    // Its light ceiling: lamp texels stay at 15, the rest glow as a flat.
+    assert_eq!(
+        m.voxel([0, 64, -10]),
+        Voxel::Emissive {
+            index: 250,
+            level: 15
+        }
+    );
+    assert_eq!(
+        m.voxel([1, 64, -10]),
+        Voxel::Emissive {
+            index: 20,
+            level: flat
+        }
+    );
+    // A's south wall runs along x: its dark rows glow at that wall's level.
+    let (wx, wz) = col(21, -1);
+    assert_eq!(
+        m.voxel([wx, 10, wz]),
+        Voxel::Emissive {
+            index: 30,
+            level: along_x
+        }
+    );
+    // The step riser of B seen from A, on a line along y.
+    let (rx, rz) = col(129, 61);
+    assert_eq!(
+        m.voxel([rx, 4, rz]),
+        Voxel::Emissive {
+            index: 7,
+            level: along_y
+        }
+    );
+    // The grate's slab glows as its side's wall.
+    assert!(matches!(
+        m.voxel([64, 56, (-23i32).div_euclid(2)]),
+        Voxel::Emissive { index: 115, level } if level == along_y
+    ));
+    // The torch's stand glows as A's flats; its flame at 15.
+    assert_eq!(
+        m.voxel([31, 0, -17]),
+        Voxel::Emissive {
+            index: 56,
+            level: flat
+        }
+    );
+    assert!(matches!(
+        m.voxel([31, 30, -17]),
+        Voxel::Emissive { level: 15, .. }
+    ));
+    // Inside the solid nothing glows: under the floor, behind the wall.
+    assert!(matches!(m.voxel([x, -3, z]), Voxel::Solid(_)));
+    assert!(matches!(m.voxel([wx, 10, wz + 2]), Voxel::Solid(_)));
+    // Without lamps, surfaces still glow and the light ceiling is a flat.
+    let m = build_glow(None);
+    assert_eq!(
+        m.voxel([0, 64, -10]),
+        Voxel::Emissive {
+            index: 250,
+            level: flat
+        }
+    );
 }

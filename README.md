@@ -5,7 +5,8 @@ An experiment: vanilla DOOM maps from a WAD file, shown as a
 world you can fly through. Every voxel is one colour from DOOM's palette, with
 DOOM's sector light baked in, drawn flat and unlit so the map reads as it does
 in DOOM. With `--light propagated` the crate's light propagation lights it
-instead, from the sky and from DOOM's light fixtures.
+instead, from the sky and from DOOM's light fixtures, and with `--light
+sector-glow` propagated light carries DOOM's sector light itself.
 
 The workspace has three parts:
 
@@ -51,12 +52,14 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--map NAME` | the map, like `E1M1` or `MAP01`; the WAD's first map by default |
 | `--list-maps` | print the WAD's maps and exit |
 | `--units-per-voxel N` | DOOM map units per voxel, 2 by default |
-| `--light MODE` | `sector` (default): DOOM's sector light baked in, no propagation. `propagated`: full-bright colours times propagated light. `both`: sector light baked in, times propagated light. `flat`: full-bright, no light at all |
-| `--min-light B` | the least brightness propagated light leaves, from 0 to 1, 0.08 by default |
-| `--falloff BASE` | each light level is `BASE` times as bright as the one above, 0.9 by default; 1 is linear |
+| `--light MODE` | `sector` (default): DOOM's sector light baked in, no propagation. `propagated`: full-bright colours times propagated light. `both`: sector light baked in, times propagated light. `sector-glow`: full-bright colours, every surface glowing at its sector's light. `flat`: full-bright, no light at all |
+| `--min-light B` | the least brightness propagated light leaves, from 0 to 1, 0.08 by default and 0 in `sector-glow` |
+| `--falloff BASE` | each light level is `BASE` times as bright as the one above, 0.9 by default; 1 is linear. In `sector-glow` lamp light follows COLORMAP instead |
+| `--sky on\|off` | sky light, on by default and off in `sector-glow` |
 | `--sky-reach N` | how many voxels sky light spreads past where it falls, 1 to 32, 32 by default |
-| `--voxel-reach N` | how many voxels a lamp's light spreads, 1 to 32, 32 by default |
-| `--lamp-gain G` | how bright lamp light is at level 15, before the cap at full brightness, 1.5 by default |
+| `--voxel-reach N` | how many voxels a lamp's light spreads, 1 to 32, 32 by default and 14 in `sector-glow` |
+| `--lamp-gain G` | how bright lamp light is at level 15, before the cap at full brightness, 1.5 by default and 1 in `sector-glow` |
+| `--precision 16\|256` | light levels each voxel holds, 16 by default and 256 in `sector-glow` |
 | `--sky-fill on\|off` | carry sky light through openings into the rooms beside the sky, on by default |
 | `--lamp-level full\|sector` | light flats and walls glow at level 15, or at their sector's light level / 16 |
 | `--stepped` | show each voxel's light as a flat step instead of smoothing it |
@@ -94,7 +97,7 @@ its north is −z.
   occlusion and, in the light modes that propagate light, by the face's
   light. The camera has no tonemapping or dithering, so the window shows the
   palette's bytes.
-- **Light.** In `propagated` and `both` the world turns on the crate's light
+- **Light.** In `propagated`, `both` and `sector-glow` the world turns on the crate's light
   propagation, and the crate wraps `PaletteMaterial` in its light bindings.
   The shader stays unlit: it scales the colour by the face's sky light, the
   lamp light around it and its own glow if it is a lamp, capped at full
@@ -119,10 +122,32 @@ its north is −z.
   light flats and walls to their sector's level instead. A shot also lights
   a flash: the voxel in front of the face it hits glows for `--flash-time`
   and goes back to air.
+- **Sector glow.** `--light sector-glow` is a hack that stands in for
+  seeding open voxels with a base light level, which the crate can't do:
+  every surface is a light source. Every solid voxel beside air glows at a
+  level standing for the light DOOM draws it in, which is its sector's
+  light through the floor, ceiling or wall table, fake contrast included.
+  The level of a floor or ceiling comes from its own column's sector, a
+  wall's from the sector of the air it faces, a grate's from its side, and
+  a pillar's stand from the sector it stands in. Lamps keep level 15, and
+  voxels inside the solid don't glow, so a crater shows only the light that
+  reaches into it. At a voxel reach of 14 light loses one level per voxel,
+  so the face of a surface glowing at level `E` reads `E − 1` from the air
+  in front of it. The voxelizer measures how much each COLORMAP table
+  darkens the palette, as the mean share of sRGB luma it leaves, picks each
+  table's level from that share, and gives the app the brightness each
+  level should show. The shader scales the colour's sRGB value, as COLORMAP
+  does, rather than its linear one, and only faces of level-15 lamps glow
+  as lamps: every other surface shows the light in front of it. Sky light
+  is off, since sky sectors glow at their own light. At rest a view looks
+  much as in `sector`, and it reacts to the world: light leaks through a
+  hole shot between two rooms, crater insides darken inward, and sector
+  edges soften over a few voxels.
 - **Screenshots.** `--screenshot` waits until every spawned chunk has been
   ready, and `VoxelWorld::light_is_settled` true, for 60 frames in a row with
-  no chunk spawning or despawning, or two minutes at most. `--fire` waits for the same signal before its first shot,
-  and each shot starts the count again.
+  no chunk spawning or despawning, or two minutes at most. `--fire` waits
+  for the same signal before its first shot, and each shot starts the count
+  again. In a lit world each shot prints how long its light took to land.
 - **The weapon.** A shot is a ray from the camera along its forward vector,
   through `VoxelWorld::raycast`, out to the view distance. Around the voxel
   it hits, `set_voxels_in` carves a ball whose edge is jittered by a hash of
@@ -173,6 +198,18 @@ its north is −z.
 - DOOM's light effects (flickering, glowing, strobing sectors) don't
   happen, and sector light levels play no part in `propagated` beyond
   `--lamp-level sector`.
+- `sector-glow` reads each face's level from the air in front of it, so a
+  face also takes the light of brighter surfaces within a few voxels: the
+  floor along a wall drawn brighter than it, or a dark sector beside a
+  bright one, comes out a little brighter than DOOM draws it. Levels are
+  whole, so a face can be about a twenty-eighth off its sector's light.
+- `sector-glow` darkens in proportion, where COLORMAP's dark tables also
+  shift hues, so dim rooms keep more of their colour than in DOOM.
+- In `sector-glow` light loses a level per voxel, so a leak through a hole
+  shot between a bright room and a dark one lights only a few voxels around
+  the hole on the dark side, less the thicker the wall. `--voxel-reach 32`
+  carries it about twice as far, and lets every bright sector's light
+  spread twice as far into its darker neighbours.
 - Pillars stand where the thing's centre is, cut off by walls and ceilings,
   and don't block shots any differently from walls.
 - With the camera close to a wall only a few chunks spawn, and the light
@@ -239,6 +276,23 @@ work around:
   table, would suit a world like this better.
 - **Light is one colour and reaches 32 voxels.** Torches can't tint their
   light, and at DOOM's scale no lamp can light a room.
+- **No base level for open voxels.** DOOM lights every place by its sector.
+  The nearest the crate allows is making every surface a lamp, which needs
+  a list of every `(palette colour, level)` pair a surface can show:
+  between 700 and 1,600 on the maps tried, searched per solid voxel as
+  above. A way for a world to seed open voxels with a level, from a lookup
+  like the voxel lookup, would make `sector-glow` a few lines.
+- **Emission is in whole levels.** `Emission::level` rounds, and light
+  loses levels in steps tied to the reach, so the brightness of a sector's
+  light lands on one of 15 steps.
+- **The glow of a lamp's own face can't be told apart from its level.**
+  The light module adds a lamp face's glow for any emissive voxel. With every
+  surface emissive, the app's own uniform tells its shader to glow only
+  faces at level 15.
+- **The look's brightness scales linear colour.** COLORMAP darkens in
+  proportion to sRGB, and the same linear factor darkens a dark colour's
+  sRGB value far more than a bright one's. Matching DOOM took scaling in
+  sRGB in the app's shader, outside the look's settings.
 
 - **Per-voxel colour known only at runtime.** `voxel_texture` takes an asset
   path, and the palette comes from the WAD. The way through is a custom
