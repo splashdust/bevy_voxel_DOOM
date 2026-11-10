@@ -1,0 +1,8 @@
+[package]
+name = "doom_wad"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reads vanilla DOOM WAD files: map lumps, palettes, flats and composite wall textures"
+
+[dependencies]

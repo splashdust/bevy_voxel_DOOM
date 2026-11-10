@@ -1,0 +1,25 @@
+[package]
+name = "doom_voxels"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "An experiment: vanilla DOOM maps from a WAD file as a bevy_voxel_world voxel world"
+
+# Its own workspace, so the experiment builds apart from the crate around it
+# and can move to a repo of its own unchanged.
+[workspace]
+members = ["crates/wad", "crates/voxelize"]
+
+[dependencies]
+doom_wad = { path = "crates/wad" }
+doom_voxelize = { path = "crates/voxelize" }
+bevy = { version = "0.20", default-features = false, features = ["3d", "ui"] }
+# While the experiment lives inside the crate's repo it builds against this
+# checkout. Once broken out, point this at a git rev of the crate instead.
+bevy_voxel_world = { path = "../.." }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,6 @@
+/target
+/.scratch
+# Game data is never committed: id's WADs are copyrighted, and Freedoom is
+# fetched by whoever runs the experiment.
+*.wad
+*.WAD

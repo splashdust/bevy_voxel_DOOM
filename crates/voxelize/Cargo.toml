@@ -1,0 +1,9 @@
+[package]
+name = "doom_voxelize"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Turns a vanilla DOOM map into voxels, one palette colour per voxel"
+
+[dependencies]
+doom_wad = { path = "../wad" }
