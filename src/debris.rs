@@ -8,11 +8,11 @@
 //! The voxel world has no colliders of its own. Static colliders are built
 //! only around live cubes, in regions of `REGION`³ voxels aligned to the
 //! world grid, each a parry voxel shape (`Collider::voxels`) holding the
-//! solid voxels with a face open to air. A region is rebuilt when the world
-//! changes inside it: at once for a carve, since cubes start inside the
-//! carved space, and at most every `REBUILD_DELAY` seconds for cubes settling
-//! into it. A region no cube has come near for `FREE_AFTER` seconds is
-//! dropped.
+//! region's solid voxels. A region is rebuilt when the world changes inside
+//! it: at once for a carve, since cubes start inside the carved space, and
+//! `REBUILD_DELAY` seconds after a cube settles into it, so a burst of
+//! settling cubes costs one rebuild. A region no cube has come near for
+//! `FREE_AFTER` seconds is dropped.
 //!
 //! A cube settles once avian puts it to sleep, once it has been slow for
 //! `SLOW_TIME` seconds, or at `LIFETIME`. It becomes a world voxel at the
@@ -239,6 +239,8 @@ struct Stats {
     active_since: Option<Instant>,
     launched: u32,
     placed: u32,
+    /// Placed or dropped when its time or the cap ran out, not at rest.
+    forced: u32,
     dropped: u32,
     most_live: usize,
     /// The longest frames, longest first, in seconds.
@@ -253,6 +255,10 @@ struct Stats {
     steps: u32,
     step_secs: f64,
     longest_step: f64,
+    /// When this frame's debris systems started, and the longest they took
+    /// in a frame, from `spray` to `report`.
+    update_started: Option<Instant>,
+    longest_update: f64,
 }
 
 fn start_step(mut stats: ResMut<Stats>) {
@@ -286,6 +292,7 @@ fn spray(
     mut materials: ResMut<Assets<StandardMaterial>>,
     time: Res<Time>,
 ) {
+    stats.update_started = Some(Instant::now());
     let now = time.elapsed_secs();
     for message in sprays.read() {
         let Some((min, max)) = bounds(message.carved.iter().map(|(p, _)| *p)) else {
@@ -414,6 +421,7 @@ fn settle(
             Landing::Unsupported(_) | Landing::Blocked => {
                 commands.entity(body).despawn();
                 stats.dropped += 1;
+                stats.forced += forced as u32;
                 continue;
             }
         };
@@ -447,6 +455,7 @@ fn settle(
             .remove::<(Cube, Mesh3d)>()
             .insert(RigidBody::Static);
         stats.placed += 1;
+        stats.forced += forced as u32;
     }
 }
 
@@ -529,7 +538,7 @@ fn update_regions(
     for key in due {
         let started = Instant::now();
         let origin = key * REGION;
-        let voxels = exposed_voxels(origin, |p| debris.solid(read(p), p));
+        let voxels = solid_voxels(origin, |p| debris.solid(read(p), p));
         let collider = (!voxels.is_empty()).then(|| Collider::voxels(Vec3::ONE, &voxels));
         let entity = match (regions.entity(key), collider) {
             (Some(entity), Some(collider)) => {
@@ -573,6 +582,12 @@ fn report(
     time: Res<Time<Real>>,
 ) {
     let busy = !cubes.is_empty() || !snapping.is_empty();
+    if let Some(started) = stats.update_started.take() {
+        if stats.active_since.is_some() {
+            let secs = started.elapsed().as_secs_f64();
+            stats.longest_update = stats.longest_update.max(secs);
+        }
+    }
     if busy {
         if let Some(mut settled) = settled {
             settled.hold();
@@ -597,14 +612,15 @@ fn report(
         .map(|f| format!("{:.1}", ms(*f as f64)))
         .collect();
     println!(
-        "debris settled after {:.1} s: {} launched, {} placed, {} dropped, at most {} in flight; \
+        "debris settled after {:.1} s: {} launched, {} placed, {} dropped, {} not at rest, at most {} in flight; \
          worst frames {} ms; {} region builds, {:.2} ms mean, {:.2} ms longest, \
          {:.2} ms most in a frame; {} regions left; {} physics steps, {:.2} ms mean, \
-         {:.2} ms longest",
+         {:.2} ms longest; debris systems {:.2} ms longest in a frame",
         since.elapsed().as_secs_f32(),
         stats.launched,
         stats.placed,
         stats.dropped,
+        stats.forced,
         stats.most_live,
         worst.join(", "),
         stats.builds,
@@ -615,6 +631,7 @@ fn report(
         stats.steps,
         ms(stats.step_secs / stats.steps.max(1) as f64),
         ms(stats.longest_step),
+        ms(stats.longest_update),
     );
     *stats = Stats::default();
 }
@@ -700,45 +717,34 @@ fn in_cone(axis: Dir3, half_angle: f32, u: f32, v: f32) -> Vec3 {
     *axis * cos + (a * turn.cos() + b * turn.sin()) * sin
 }
 
-/// The solid voxels with a face open to air in the region whose corner is
-/// at `origin`, and one voxel around it so neighbouring regions overlap, as
-/// positions from `origin`. Reads each voxel once, `REGION + 4` across.
-fn exposed_voxels(origin: IVec3, solid: impl Fn(IVec3) -> bool) -> Vec<IVec3> {
-    const READ: i32 = REGION + 4;
-    let index = |l: IVec3| ((l.z + 2) * READ + l.y + 2) * READ + l.x + 2;
-    let mut cells = vec![false; (READ * READ * READ) as usize];
-    for z in -2..REGION + 2 {
-        for y in -2..REGION + 2 {
-            for x in -2..REGION + 2 {
-                let l = IVec3::new(x, y, z);
-                cells[index(l) as usize] = solid(origin + l);
-            }
-        }
-    }
-    let at = |l: IVec3| cells[index(l) as usize];
-    let mut exposed = Vec::new();
+/// The solid voxels of the region whose corner is at `origin`, and of one
+/// voxel around it so neighbouring regions overlap, as positions from
+/// `origin`; none if the region holds no air, since no cube can reach it.
+///
+/// It takes every solid voxel, not only those with a face open to air: a
+/// shell one voxel thick lets a cube that other cubes push into it come out
+/// on its far side, inside the solid, where nothing pushes it back. The
+/// voxel shape only collides on faces between a voxel and a voxel it
+/// doesn't hold, so voxels deep inside cost memory, not contacts.
+fn solid_voxels(origin: IVec3, solid: impl Fn(IVec3) -> bool) -> Vec<IVec3> {
+    let mut voxels = Vec::new();
+    let mut air = false;
     for z in -1..REGION + 1 {
         for y in -1..REGION + 1 {
             for x in -1..REGION + 1 {
                 let l = IVec3::new(x, y, z);
-                if at(l)
-                    && [
-                        IVec3::X,
-                        IVec3::NEG_X,
-                        IVec3::Y,
-                        IVec3::NEG_Y,
-                        IVec3::Z,
-                        IVec3::NEG_Z,
-                    ]
-                    .into_iter()
-                    .any(|d| !at(l + d))
-                {
-                    exposed.push(l);
+                if solid(origin + l) {
+                    voxels.push(l);
+                } else {
+                    air = true;
                 }
             }
         }
     }
-    exposed
+    if !air {
+        voxels.clear();
+    }
+    voxels
 }
 
 /// The collider regions: which exist, when a cube last needed each, and
@@ -996,20 +1002,20 @@ mod tests {
     }
 
     #[test]
-    fn only_voxels_with_an_open_face_collide() {
-        // A floor: the top layer is exposed, over the region and one voxel round.
-        let floor = exposed_voxels(IVec3::new(32, -8, 0), |p| p.y < 0);
-        assert_eq!(floor.len(), ((REGION + 2) * (REGION + 2)) as usize);
-        assert!(floor.iter().all(|l| l.y == 7));
-        // A wall one voxel thick: every voxel of it.
-        let wall = exposed_voxels(IVec3::ZERO, |p| p.x == 5);
-        assert_eq!(wall.len(), ((REGION + 2) * (REGION + 2)) as usize);
-        // Solid all through: nothing.
-        assert!(exposed_voxels(IVec3::ZERO, |_| true).is_empty());
+    fn regions_collide_with_their_solid_voxels_and_one_more_round() {
+        let side = (REGION + 2) as usize;
+        // A floor: every solid layer, over the region and one voxel round.
+        let floor = solid_voxels(IVec3::new(32, -8, 0), |p| p.y < 0);
+        assert_eq!(floor.len(), 9 * side * side);
+        assert!(floor.iter().all(|l| (-1..8).contains(&l.y)));
+        // A wall one voxel thick.
+        assert_eq!(solid_voxels(IVec3::ZERO, |p| p.x == 5).len(), side * side);
+        // Solid all through: nothing a cube could reach.
+        assert!(solid_voxels(IVec3::ZERO, |_| true).is_empty());
         // One voxel past the region still counts, so regions overlap.
-        let lone = exposed_voxels(IVec3::ZERO, |p| p == IVec3::new(-1, 3, REGION));
+        let lone = solid_voxels(IVec3::ZERO, |p| p == IVec3::new(-1, 3, REGION));
         assert_eq!(lone, vec![IVec3::new(-1, 3, REGION)]);
-        assert!(exposed_voxels(IVec3::ZERO, |p| p == IVec3::new(-2, 3, 3)).is_empty());
+        assert!(solid_voxels(IVec3::ZERO, |p| p == IVec3::new(-2, 3, 3)).is_empty());
     }
 
     #[test]
