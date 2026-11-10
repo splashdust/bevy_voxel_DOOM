@@ -7,6 +7,7 @@ mod args;
 mod camera;
 mod capture;
 mod collide;
+mod debris;
 mod hud;
 mod info;
 mod input;
@@ -148,9 +149,16 @@ fn main() -> AppExit {
     })
     .add_plugins(capture::CapturePlugin {
         screenshot: args.screenshot.clone(),
+        delay: args.screenshot_delay,
         quit_after: args.quit_after,
         track_settling: args.fire > 0 || args.script.is_some(),
         frame_times: args.frame_times,
+    })
+    .add_plugins(debris::DebrisPlugin {
+        map: Arc::clone(&map),
+        count: args.debris,
+        units_per_voxel: args.units_per_voxel,
+        flash,
     })
     .add_plugins(weapon::WeaponPlugin {
         radius: args.blast_radius,

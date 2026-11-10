@@ -10,6 +10,10 @@
 //! reads its light as settled.
 //! [`WorldSettled`] carries that signal; anything that changes the world on
 //! the way to a screenshot, like a scripted shot, starts the count again.
+//!
+//! `--screenshot-delay S` takes the screenshot S seconds after the last such
+//! change instead, settled or not, or S seconds after the world first settles
+//! if nothing changes it.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -31,6 +35,9 @@ const GIVE_UP: Duration = Duration::from_secs(120);
 
 pub struct CapturePlugin {
     pub screenshot: Option<PathBuf>,
+    /// Seconds after the last change to take the screenshot at, settled or
+    /// not.
+    pub delay: Option<f32>,
     pub quit_after: Option<f32>,
     /// Track [`WorldSettled`] even without a screenshot.
     pub track_settling: bool,
@@ -89,6 +96,8 @@ pub struct WorldSettled {
     /// was last unsettled, in seconds since start.
     chunks_busy_at: f32,
     light_busy_at: f32,
+    /// When `unsettle` was last called.
+    changed_at: Option<Instant>,
 }
 
 impl WorldSettled {
@@ -98,6 +107,14 @@ impl WorldSettled {
 
     /// Starts the count again, after changing the world.
     pub fn unsettle(&mut self) {
+        self.quiet = 0;
+        self.changed_at = Some(Instant::now());
+    }
+
+    /// Starts the count again, for something still moving that will change
+    /// the world, like debris in flight. Unlike `unsettle` it doesn't move
+    /// the clock of `--screenshot-delay`.
+    pub fn hold(&mut self) {
         self.quiet = 0;
     }
 }
@@ -115,6 +132,9 @@ struct ShotPlan {
     path: PathBuf,
     started: Instant,
     requested: bool,
+    delay: Option<f32>,
+    /// When the world first settled.
+    settled_at: Option<Instant>,
 }
 
 /// Set once the screenshot is on disk.
@@ -133,6 +153,8 @@ impl Plugin for CapturePlugin {
                 path: path.clone(),
                 started: Instant::now(),
                 requested: false,
+                delay: self.delay,
+                settled_at: None,
             })
             .init_resource::<ShotSaved>()
             .add_systems(Update, take_screenshot.in_set(CaptureSet::Shoot));
@@ -200,7 +222,17 @@ fn take_screenshot(
     }
     let elapsed = plan.started.elapsed();
     let timed_out = elapsed > GIVE_UP;
-    if !settled.is_settled() && !timed_out {
+    if settled.is_settled() && plan.settled_at.is_none() {
+        plan.settled_at = Some(Instant::now());
+    }
+    let ready = match plan.delay {
+        Some(delay) => settled
+            .changed_at
+            .or(plan.settled_at)
+            .is_some_and(|t| t.elapsed().as_secs_f32() >= delay),
+        None => settled.is_settled(),
+    };
+    if !ready && !timed_out {
         return;
     }
     let (busy, count) = (settled.busy, settled.count);

@@ -16,7 +16,7 @@ The workspace has three parts:
 |---|---|
 | `crates/wad` (`doom_wad`) | reads WAD files: map lumps, the palette, COLORMAP, flats, wall textures, sprites and sounds |
 | `crates/voxelize` (`doom_voxelize`) | turns one map into voxels: `VoxelMap` |
-| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things |
+| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things, the weapon and its debris |
 
 ## Running
 
@@ -85,7 +85,9 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--pitch DEG` | start pitch, positive looks up |
 | `--blast-radius R` | the radius in voxels of the ball the player's shots carve, 4 by default |
 | `--fire N` | once the world is ready, fire N shots in a small spiral around the view centre |
-| `--screenshot PATH` | wait until the world in view has been generated and meshed, and its light has settled, save a PNG and exit. With `--fire`, it waits for the carved chunks too |
+| `--debris N` | debris cubes a shot throws out, 16 by default; 0 turns debris off |
+| `--screenshot PATH` | wait until the world in view has been generated and meshed, and its light has settled, save a PNG and exit. With `--fire`, it waits for the carved chunks too, and for debris to settle |
+| `--screenshot-delay S` | take the screenshot S seconds after the last scripted shot, settled or not, to catch debris in the air |
 | `--quit-after S` | exit after S seconds |
 
 At start it prints how long building the voxel map took and the map's voxel
@@ -268,6 +270,36 @@ its north is −z.
   death, and pickups. Volume falls off with distance as DOOM's does, full
   within 200 units and silent past 1200, with at most a dozen sounds at
   once.
+- **Debris** (`src/debris.rs`). `Carver::carve` sends `SprayDebris` with
+  the voxels it carved, whatever did the carving, and some of them fly out
+  as cubes 0.9 voxels across: `--debris` for a player's shot, fewer for a
+  bullet pit, dozens for a barrel's crater (the count grows with the square
+  root of the carved volume). They fly along the hit normal in a cone, or
+  every way from a barrel, with some lift and spin, under
+  avian3d physics at DOOM's scale (32 map units to the metre). A cube shows
+  its voxel's palette colour through an unlit material shared by every cube
+  of that colour, with the map's contrast gain, as the world draws it. The
+  world gets colliders only where cubes fly: regions of 16³ voxels, each a
+  parry voxel shape (`Collider::voxels`) of its solid voxels, read with
+  `VoxelWorld::get_voxel` and from the map where that is unset. Every solid
+  voxel goes in, not only those open to air: with a shell one voxel thick, a
+  cube pushed into it by others could come out inside the solid. The shape
+  only collides on its open faces, so the rest costs memory, not contacts.
+  A carve rebuilds the regions around it at once, and a settling cube a
+  tenth of a second later, so a burst costs one rebuild. Any other edit
+  reaches them through `EditsCommitted`, a frame late, and rebuilds them a
+  tenth of a second after that. A region no cube has come near for two
+  seconds is dropped. A cube settles when avian puts it to sleep, after
+  0.3 s slow, or at 8 s, or at once when more than 500 are in flight, oldest
+  first. It becomes a world voxel in the cell holding its centre, or one of
+  the two above if that is solid, and a copy slides and turns into the cell
+  and stays until the chunk has remeshed, so nothing blinks. A cube with
+  nothing solid under or beside its cell, stopped in mid-air or on a cube
+  still in flight, waits, and is dropped if its time runs out, as is a cube
+  that falls out of the bottom of the map. Once all
+  debris has settled, a line says how many cubes flew, settled and were
+  dropped, the longest frames meanwhile, and how long collider builds and
+  physics steps took.
 - **The voxelizer** (`crates/voxelize`). At import every voxel column gets its
   sector from the map's BSP, with a nearest-linedef test for the void outside
   the map. A voxel is solid below its sector's floor, air up to the ceiling
@@ -329,8 +361,7 @@ its north is −z.
 - Inside the solid, each column takes one neighbouring sector, so where two
   walls or a wall and a step meet, the inside shows only one of them. The
   top of the world over non-sky ceilings stays black.
-- Shots pass through the transparent holes of grates, and nothing is
-  thrown out of a crater. Craters aren't saved.
+- Shots pass through the transparent holes of grates. Craters aren't saved.
 - Monsters approximated: the Wolfenstein SS fires the chaingunner's
   bullets; the revenant's rocket turns toward the player every 4 tics at
   DOOM's turn rate but leaves no smoke, and its fist uses the plain melee
@@ -366,6 +397,24 @@ its north is −z.
 - The player aims with the crosshair, without DOOM's vertical autoaim;
   monsters aim their hitscans and projectiles at the player directly,
   spread only sideways as DOOM spreads them.
+- Debris is drawn unlit at its full colour: in the light modes that
+  propagate light it isn't darkened by the light around it, and a settled
+  cube changes brightness when it becomes a lit voxel. It has no ambient
+  occlusion in flight either, so a settled cube darkens a little where it
+  touches others.
+- A settled cube snaps by up to half a voxel sideways and turns to the
+  grid, over a tenth of a second. A cube leaning on another at an angle can
+  land a cell higher than it looked.
+- An edit that sends no `SprayDebris`, such as a flash appearing, reaches
+  the debris colliders only a frame and a tenth of a second later.
+- Region colliders overlap by one voxel so their edges meet, but a cube
+  sliding across a region's edge can still catch slightly on it.
+- A settling cube's voxel can land where another cube still in flight is,
+  which then hops out of it.
+- Past 500 cubes in flight the oldest settle at once, and those in mid-air
+  vanish. `--fire 48` reaches that; a held chaingun mostly does not.
+- Debris doesn't collide with the player, monsters or projectiles, and
+  shots pass through it.
 
 ## Which bevy_voxel_world
 
@@ -489,6 +538,18 @@ work around:
   was, so collecting the voxels a carve emptied, for debris, reads them
   through `get_voxel_fn` inside the closure, with the map as the fallback
   for unpublished chunks.
+- **Physics colliders have to be built from voxels by hand.** The crate
+  has no collision. Building avian colliders took a box read voxel by voxel
+  through `get_voxel_fn`, falling back to the map where it reads `Unset`,
+  and bookkeeping of its own to know which regions an edit has changed.
+  `EditsCommitted` names the voxels each edit changed, but a frame late, so
+  a carve also has to say so at once, through `SprayDebris`, for cubes
+  starting in the carved space. A read of a box of voxels at once would
+  make the builds cheaper.
+- **No signal that an edit has been meshed.** A settled cube must stay on
+  screen until its voxel shows, or the pile blinks. The app waits for a
+  `ChunkPublished` of the chunk after the frame the edit was set, with the
+  chunk `Ready`, and two frames more for the mesh to reach the screen.
 - **LOD would lose thin walls.** A coarse level samples every `1 << L`th
   voxel, so one-voxel walls and steps vanish or flicker between levels. The
   app uses no LOD, so the view distance is bounded by the chunk count.

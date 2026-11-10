@@ -54,7 +54,10 @@ usage: doom_voxels --wad PATH [options]
   --pitch DEG             start pitch, positive looking up
   --blast-radius R        the weapon's carved ball radius in voxels (default 4)
   --fire N                fire N shots around the view centre once the world is ready
+  --debris N              debris cubes a shot throws out (default 16, 0 for none);
+                          smaller carves throw fewer, barrels more
   --screenshot PATH       wait for the world around the camera to finish, save a PNG, exit
+  --screenshot-delay S    take the screenshot S seconds after the last scripted shot instead
   --quit-after S          exit after S seconds
   --no-vsync              don't wait for the display, so the HUD's frame rate shows the cost
   --help                  this text";
@@ -76,6 +79,8 @@ pub struct Args {
     pub contrast: f32,
     pub blast_radius: i32,
     pub fire: u32,
+    pub debris: u32,
+    pub screenshot_delay: Option<f32>,
     pub screenshot: Option<PathBuf>,
     pub quit_after: Option<f32>,
     pub no_vsync: bool,
@@ -250,6 +255,8 @@ fn parse_from(
         contrast: 1.25,
         blast_radius: 4,
         fire: 0,
+        debris: 16,
+        screenshot_delay: None,
         screenshot: None,
         quit_after: None,
         no_vsync: false,
@@ -313,6 +320,17 @@ fn parse_from(
                         args.fire = value
                             .parse()
                             .map_err(|_| format!("{word} needs a whole number"))?
+                    }
+                    "--debris" => {
+                        args.debris = value
+                            .parse()
+                            .map_err(|_| format!("{word} needs a whole number"))?
+                    }
+                    "--screenshot-delay" => {
+                        args.screenshot_delay = Some(number("seconds")?)
+                            .filter(|s| *s >= 0.0)
+                            .ok_or_else(|| format!("{word} needs seconds, at least 0"))
+                            .map(Some)?
                     }
                     "--light" => {
                         args.light = LightMode::parse(&value).ok_or_else(|| {
@@ -574,5 +592,19 @@ mod tests {
         .is_ok_and(|a| a.mute && a.freeze && a.frame_times && a.list_things));
         assert_eq!(args.script.map(|s| s.len()), Some(2));
         assert!(parse(&["--script", "hop"], Some("a.wad")).is_err());
+    }
+
+    #[test]
+    fn debris_flags() {
+        let args = parse(&[], Some("a.wad")).unwrap();
+        assert_eq!((args.debris, args.screenshot_delay), (16, None));
+        let args = parse(
+            &["--debris", "0", "--screenshot-delay", "0.5"],
+            Some("a.wad"),
+        )
+        .unwrap();
+        assert_eq!((args.debris, args.screenshot_delay), (0, Some(0.5)));
+        assert!(parse(&["--debris", "-1"], Some("a.wad")).is_err());
+        assert!(parse(&["--screenshot-delay", "-1"], Some("a.wad")).is_err());
     }
 }

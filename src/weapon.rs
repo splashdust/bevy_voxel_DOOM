@@ -34,6 +34,7 @@ use doom_voxelize::Voxel;
 use crate::actors::{spawn_effect, DamageQueue, Hit, Noise, Rng, Shot, ShotEnd, Who};
 use crate::camera::FlyCamera;
 use crate::capture::{CaptureSet, WorldSettled};
+use crate::debris::SprayDebris;
 use crate::info;
 use crate::input::Intent;
 use crate::player::Player;
@@ -135,6 +136,7 @@ pub struct Carver<'w, 's> {
     pub voxel_world: VoxelWorld<'w, 's, DoomWorld>,
     map: Res<'w, GameMap>,
     edited: Res<'w, EditedChunks>,
+    spray: MessageWriter<'w, SprayDebris>,
 }
 
 impl Carver<'_, '_> {
@@ -146,7 +148,8 @@ impl Carver<'_, '_> {
     /// Blows a ball of `radius` voxels out of the world around `hit`, the
     /// solid voxel something struck (from the side `normal` points to, when
     /// known), and scorches a shell around it. Returns the solid voxels it
-    /// emptied, with the materials they had.
+    /// emptied, with the materials they had, and sends them as
+    /// [`SprayDebris`], thrown along `normal`, or every way without one.
     ///
     /// Every source of destruction calls this, so anything that reacts to
     /// destruction hooks in here.
@@ -198,7 +201,14 @@ impl Carver<'_, '_> {
                 }
             },
         );
-        let _ = normal;
+        if !carved.is_empty() {
+            let normal = normal.map_or(Vec3::ZERO, |n| n.as_vec3());
+            self.spray.write(SprayDebris {
+                hit: hit.as_vec3() + 0.5 + normal * 0.5,
+                normal,
+                carved: carved.clone(),
+            });
+        }
         carved
     }
 }
