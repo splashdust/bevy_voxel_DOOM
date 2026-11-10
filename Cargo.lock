@@ -2544,6 +2544,7 @@ name = "doom_voxelize"
 version = "0.1.0"
 dependencies = [
  "doom_wad",
+ "png",
 ]
 
 [[package]]
