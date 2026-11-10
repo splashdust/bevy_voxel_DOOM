@@ -868,7 +868,6 @@ impl Regions {
     /// a frame after they were made, carves and settled cubes included, and
     /// so do edits nothing told the debris about, like a shot's flash.
     fn committed(&mut self, min: IVec3, max: IVec3, now: f32, set_frame: u32) {
-        self.edits += 1;
         for key in Self::keys(min, max) {
             if let Some(region) = self.regions.get_mut(&key) {
                 if region.built.is_some() && region.built_frame < set_frame {
