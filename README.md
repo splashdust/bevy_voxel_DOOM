@@ -80,6 +80,29 @@ its north is −z.
 - **Screenshots.** `--screenshot` waits until every spawned chunk has been
   ready for 60 frames in a row with no chunk spawning or despawning, or two
   minutes at most.
+- **The voxelizer** (`crates/voxelize`). At import every voxel column gets its
+  sector from the map's BSP, with a nearest-linedef test for the void outside
+  the map. A voxel is solid below its sector's floor, air up to the ceiling
+  (or to the map top under a sky ceiling) and solid above. The solid voxel
+  under the air takes the floor flat, the one over it the ceiling flat, and
+  solid voxels beside air take the wall texture of the linedef between them,
+  with DOOM's pegging rules. Masked middle textures (grates) are one-voxel
+  slabs whose transparent texels are air. Doors are baked open. Sector light
+  goes through COLORMAP at a fixed viewing distance.
+- **The WAD reader** (`crates/wad`) has no dependencies and reads the map
+  lumps, PLAYPAL, COLORMAP, flats and composite wall textures.
+
+## Known gaps
+
+- A corner column touching two different walls shows one wall's texture.
+- Walls beside sky sectors run up to the map top with their texture, where
+  DOOM would paint sky above them.
+- Animated flats and textures, and switches, show their first frame.
+- Doors, lifts and crushers don't move.
+- No things: monsters, items and decorations aren't shown.
+- No collision: the camera only flies.
+- With `--closed-doors`, the bottom face of a closed door shows the ceiling
+  flat instead of the door texture.
 
 ## Which bevy_voxel_world
 
