@@ -7,3 +7,6 @@ description = "Turns a vanilla DOOM map into voxels, one palette colour per voxe
 
 [dependencies]
 doom_wad = { path = "../wad" }
+
+[dev-dependencies]
+png = "0.18"

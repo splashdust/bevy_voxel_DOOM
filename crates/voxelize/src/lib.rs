@@ -5,10 +5,26 @@
 //! `[y*s, (y+1)*s)` and DOOM map y in `(-(z+1)*s, -z*s]`. So DOOM's east is
 //! +x, DOOM's north is −z (Bevy's forward), and the result is right-handed.
 //!
-//! This is a placeholder: it builds a small test room so the app can run
-//! before the real voxelizer exists.
+//! DOOM is 2.5D: each map point lies in one sector, with one floor and one
+//! ceiling height. At import every voxel column gets its sector (or the
+//! void) from the map's BSP, see `locate`. A voxel is then tested at its
+//! centre: solid below the floor, air up to the ceiling (or to the map top
+//! under a sky ceiling), solid above. Void columns are solid up to the top.
+//!
+//! Colours: the solid voxel under a sector's air is its floor flat, the one
+//! over it its ceiling flat; other solid voxels next to air are walls,
+//! textured from the linedef between them; the rest get [`INTERIOR`].
+//! See `build` for the import and `colour` for the texturing rules.
 
-use doom_wad::{Palette, Wad, WadError};
+use doom_wad::{Palette, Picture, Wad, WadError};
+
+mod build;
+mod colour;
+mod light;
+mod locate;
+mod tiles;
+
+pub use build::sky_texture_name;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Voxel {
@@ -16,6 +32,9 @@ pub enum Voxel {
     /// A palette index into [`VoxelMap::palette`].
     Solid(u8),
 }
+
+/// The colour of solid voxels nothing can see: palette index 0, black.
+pub const INTERIOR: u8 = 0;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -38,34 +57,128 @@ impl Default for Options {
     }
 }
 
+/// A column's sector id when it lies in no sector.
+const VOID: u16 = u16::MAX;
+/// A column's line id when no linedef is near it.
+const NO_LINE: u16 = 0x7fff;
+/// Set on a column's line id when the column holds that line's masked
+/// middle texture.
+const MASKED: u16 = 0x8000;
+/// A texture or flat id for "none".
+const NO_TEX: u16 = u16::MAX;
+
+/// A sector as the voxels see it.
+#[derive(Clone, Debug)]
+struct SectorInfo {
+    /// Heights in map units, doors opened when asked.
+    floor: i32,
+    ceiling: i32,
+    /// The air span in voxels: `floor_v..ceiling_v`, or `floor_v..top` under sky.
+    floor_v: i32,
+    ceiling_v: i32,
+    sky: bool,
+    floor_flat: u16,
+    ceiling_flat: u16,
+    /// The light table for its flats.
+    flat_table: u8,
+}
+
+#[derive(Clone, Debug)]
+struct SideInfo {
+    sector: u16,
+    x_offset: f64,
+    y_offset: f64,
+    upper: u16,
+    lower: u16,
+    middle: u16,
+    /// The light table for its walls.
+    table: u8,
+}
+
+#[derive(Clone, Debug)]
+struct LineInfo {
+    /// v1 in map units.
+    a: [f64; 2],
+    /// Unit direction v1 → v2.
+    dir: [f64; 2],
+    len: f64,
+    flags: u16,
+    /// Front (right) then back sidedef.
+    sides: [Option<SideInfo>; 2],
+    /// The side whose masked middle texture this two-sided line draws.
+    masked_side: Option<usize>,
+}
+
 pub struct VoxelMap {
     palette: Palette,
+    s: i32,
     min: [i32; 3],
     max: [i32; 3],
+    /// Columns across (x) and down (z); column (x, z) is at
+    /// `(z - min[2]) * width + (x - min[0])`.
+    width: i32,
+    depth: i32,
+    /// Per column: sector id or [`VOID`].
+    columns: Vec<u16>,
+    /// Per column: the linedef its walls are textured from, or [`NO_LINE`],
+    /// with [`MASKED`] set where the column holds a masked slab.
+    lines: Vec<u16>,
+    sectors: Vec<SectorInfo>,
+    line_info: Vec<LineInfo>,
+    flats: Vec<Box<[u8; 4096]>>,
+    walls: Vec<Picture>,
+    /// Colour tables: 0 is the identity, 1 + k is COLORMAP table k.
+    tables: Vec<[u8; 256]>,
+    tiles: tiles::Tiles,
+    spawn: ([f32; 3], f32),
+    sky: [u8; 3],
 }
 
 impl VoxelMap {
-    pub fn build(_wad: &Wad, _map: &str, _options: &Options) -> Result<VoxelMap, WadError> {
-        let mut palette = [[0u8; 3]; 256];
-        for (i, c) in palette.iter_mut().enumerate() {
-            *c = [i as u8, (255 - i) as u8, ((i * 7) % 256) as u8];
-        }
-        Ok(VoxelMap {
-            palette,
-            min: [-64, -8, -64],
-            max: [64, 64, 64],
-        })
+    pub fn build(wad: &Wad, map: &str, options: &Options) -> Result<VoxelMap, WadError> {
+        let data = wad.map(map)?;
+        let palette = wad.palette()?;
+        let colormap = wad.colormap()?;
+        let textures = wad.textures()?;
+        VoxelMap::from_map_data(&data, palette, &colormap, &textures, options)
     }
 
     /// The voxel at `p`. Thread-safe and deterministic: the app calls this
     /// from the voxel world's worker threads.
     pub fn voxel(&self, p: [i32; 3]) -> Voxel {
-        let inside = (-48..48).contains(&p[0]) && (0..40).contains(&p[1]) && (-48..48).contains(&p[2]);
-        if inside {
-            Voxel::Air
-        } else {
-            Voxel::Solid(((p[0] + p[1] * 3 + p[2] * 5).rem_euclid(256)) as u8)
+        let [x, y, z] = p;
+        if y >= self.max[1] {
+            return Voxel::Air;
         }
+        if y < self.min[1] {
+            return Voxel::Solid(INTERIOR);
+        }
+        let Some(col) = self.column(x, z) else {
+            return Voxel::Solid(INTERIOR);
+        };
+        let sector = self.columns[col];
+        if sector != VOID {
+            let sec = &self.sectors[sector as usize];
+            if y >= sec.floor_v && (sec.sky || y < sec.ceiling_v) {
+                let line = self.lines[col];
+                if line & MASKED != 0 {
+                    return self.masked(line & !MASKED, x, y, z);
+                }
+                return Voxel::Air;
+            }
+            if y == sec.floor_v - 1 {
+                return Voxel::Solid(self.flat(sec.floor_flat, sec.flat_table, x, z));
+            }
+            if !sec.sky && y == sec.ceiling_v {
+                return Voxel::Solid(self.flat(sec.ceiling_flat, sec.flat_table, x, z));
+            }
+        }
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            if let Some(air) = self.air_sector(x + dx, y, z + dz) {
+                return Voxel::Solid(self.wall(col, air, p, (dx, dz)));
+            }
+        }
+        Voxel::Solid(INTERIOR)
     }
 
     /// `Some(v)` when every voxel in the box `min..max` (max exclusive) is
@@ -73,10 +186,23 @@ impl VoxelMap {
     /// be cheap: the app calls it once per chunk to skip generating uniform
     /// chunks.
     pub fn uniform_in(&self, min: [i32; 3], max: [i32; 3]) -> Option<Voxel> {
-        if max[1] <= self.min[1] {
-            return Some(Voxel::Solid(0));
+        let (bottom, top) = (self.min[1], self.max[1]);
+        if min[1] >= top {
+            return Some(Voxel::Air);
         }
-        if min[1] >= self.max[1] {
+        if max[1] <= bottom {
+            return Some(Voxel::Solid(INTERIOR));
+        }
+        let st = self.tiles.stats(
+            min[0] - self.min[0],
+            max[0] - self.min[0],
+            min[2] - self.min[2],
+            max[2] - self.min[2],
+        );
+        if max[1] <= top && (max[1] <= st.lo || min[1] >= st.hi) {
+            return Some(Voxel::Solid(INTERIOR));
+        }
+        if !st.blocked && min[1] >= st.air_lo && max[1] <= st.air_hi {
             return Some(Voxel::Air);
         }
         None
@@ -96,11 +222,52 @@ impl VoxelMap {
     /// Player 1's start, in voxel coordinates at eye height (DOOM's view
     /// height, 41 units), and the yaw in radians around +y, 0 facing −z.
     pub fn spawn(&self) -> ([f32; 3], f32) {
-        ([0.0, 20.0, 0.0], 0.0)
+        self.spawn
     }
 
     /// An RGB colour for the sky, for the clear colour.
     pub fn sky_colour(&self) -> [u8; 3] {
-        [90, 110, 140]
+        self.sky
+    }
+
+    /// Map units per voxel.
+    pub fn units_per_voxel(&self) -> i32 {
+        self.s
+    }
+
+    /// The sector of voxel column `(x, z)`, or `None` for the void and
+    /// outside the map.
+    pub fn column_sector(&self, x: i32, z: i32) -> Option<u16> {
+        let s = self.columns[self.column(x, z)?];
+        (s != VOID).then_some(s)
+    }
+
+    /// The air span of column `(x, z)` in voxels, `floor..ceiling`, with the
+    /// ceiling at the map top under sky; `None` for the void.
+    pub fn column_air(&self, x: i32, z: i32) -> Option<(i32, i32)> {
+        let sec = &self.sectors[self.column_sector(x, z)? as usize];
+        let ceiling = if sec.sky { self.max[1] } else { sec.ceiling_v };
+        Some((sec.floor_v, ceiling))
+    }
+
+    fn column(&self, x: i32, z: i32) -> Option<usize> {
+        let (cx, cz) = (x - self.min[0], z - self.min[2]);
+        if cx < 0 || cz < 0 || cx >= self.width || cz >= self.depth {
+            return None;
+        }
+        Some((cz * self.width + cx) as usize)
+    }
+
+    /// The sector of column `(x, z)` when voxel height `y` in it is air.
+    fn air_sector(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        let s = self.columns[self.column(x, z)?];
+        if s == VOID {
+            return None;
+        }
+        let sec = &self.sectors[s as usize];
+        (y >= sec.floor_v && (sec.sky || y < sec.ceiling_v)).then_some(s)
     }
 }
+
+#[cfg(test)]
+mod tests;
