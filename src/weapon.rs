@@ -27,6 +27,7 @@ use doom_voxelize::{Voxel, VoxelMap};
 
 use crate::camera::FlyCamera;
 use crate::capture::{CaptureSet, WorldSettled};
+use crate::debris::SprayDebris;
 use crate::world::{material, DoomWorld};
 
 /// DOOM's chaingun: a shot every 4 tics at 35 tics a second.
@@ -121,6 +122,7 @@ impl Plugin for WeaponPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fire_from_mouse(
     time: Res<Time>,
     buttons: Res<ButtonInput<MouseButton>>,
@@ -129,6 +131,7 @@ fn fire_from_mouse(
     camera: Single<&Transform, With<FlyCamera>>,
     mut weapon: ResMut<Weapon>,
     mut voxel_world: VoxelWorld<DoomWorld>,
+    mut spray: MessageWriter<SprayDebris>,
 ) {
     let captured = cursor.grab_mode != CursorGrabMode::None;
     if !captured
@@ -149,7 +152,7 @@ fn fire_from_mouse(
     if weapon.cooldown <= 0.0 {
         weapon.cooldown += SHOT_INTERVAL;
         let ray = Ray3d::new(camera.translation, camera.forward());
-        shoot(&mut voxel_world, &mut weapon, ray);
+        shoot(&mut voxel_world, &mut weapon, ray, &mut spray);
     }
 }
 
@@ -185,6 +188,7 @@ fn fire_scripted(
     camera: Single<&Transform, With<FlyCamera>>,
     mut weapon: ResMut<Weapon>,
     mut voxel_world: VoxelWorld<DoomWorld>,
+    mut spray: MessageWriter<SprayDebris>,
 ) {
     if shots.fired >= shots.total || (shots.fired == 0 && !settled.is_settled()) {
         return;
@@ -205,7 +209,7 @@ fn fire_scripted(
     let aim = Quat::from_euler(EulerRot::YXZ, off * turn.cos(), off * turn.sin(), 0.0);
     let direction = Dir3::new(camera.rotation * aim * Vec3::NEG_Z).unwrap_or(Dir3::NEG_Z);
     let ray = Ray3d::new(camera.translation, direction);
-    match shoot(&mut voxel_world, &mut weapon, ray) {
+    match shoot(&mut voxel_world, &mut weapon, ray, &mut spray) {
         Some(hit) => println!("shot {}: hit voxel {hit}", i + 1),
         None => println!("shot {}: missed", i + 1),
     }
@@ -245,10 +249,12 @@ fn stops_a_shot(voxel: WorldVoxel<u16>, flash: Option<u16>) -> bool {
 
 /// Fires along `ray`: carves and scorches around the first solid voxel
 /// within the weapon's range, lights a flash in front of it, and returns it.
+/// The carved voxels go to `spray`, to be thrown out as debris.
 fn shoot(
     voxel_world: &mut VoxelWorld<DoomWorld>,
     weapon: &mut Weapon,
     ray: Ray3d,
+    spray: &mut MessageWriter<SprayDebris>,
 ) -> Option<IVec3> {
     let (map, radius, flash) = (Arc::clone(&weapon.map), weapon.radius, weapon.flash);
     let hit = voxel_world.raycast(ray, &|(_, voxel)| stops_a_shot(voxel, flash))?;
@@ -260,20 +266,27 @@ fn shoot(
     // What's there now: an edit, a published voxel, or what the map makes.
     let current = voxel_world.get_voxel_fn();
     let reach = radius + SCORCH_DEPTH.ceil() as i32 + 1;
+    let mut carved = Vec::new();
     voxel_world.set_voxels_in(
         centre - IVec3::splat(reach),
         centre + IVec3::splat(reach + 1),
         |p| {
             let effect = blast(p - centre, p, radius)?;
-            let solid = match current(p) {
-                WorldVoxel::Unset => map.voxel(p.to_array()).is_solid(),
-                voxel => voxel.is_solid(),
+            let was = match current(p) {
+                WorldVoxel::Unset => match map.voxel(p.to_array()) {
+                    Voxel::Solid(index) => Some(material(index, 0)),
+                    Voxel::Emissive { index, level } => Some(material(index, level)),
+                    Voxel::Air => None,
+                },
+                WorldVoxel::Solid(m) => Some(m),
+                WorldVoxel::Air => None,
             };
-            if !solid {
-                return None;
-            }
+            let was = was?;
             match effect {
-                Blast::Carve => Some(WorldVoxel::Air),
+                Blast::Carve => {
+                    carved.push((p, was));
+                    Some(WorldVoxel::Air)
+                }
                 // A scorched lamp goes out.
                 Blast::Scorch(steps) => match map.voxel(p.to_array()) {
                     Voxel::Solid(index) | Voxel::Emissive { index, .. } => {
@@ -284,6 +297,13 @@ fn shoot(
             }
         },
     );
+    if !carved.is_empty() {
+        spray.write(SprayDebris {
+            hit: hit.position,
+            normal: hit.normal.unwrap_or(-*ray.direction),
+            carved,
+        });
+    }
     if let (Some(flash), Some(normal)) = (flash, hit.voxel_normal()) {
         let p = centre + normal;
         let air = match current(p) {
