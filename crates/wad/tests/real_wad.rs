@@ -121,3 +121,39 @@ fn reads_a_real_wad() {
         }
     }
 }
+
+#[test]
+fn reads_a_real_wads_sprites() {
+    let Some(path) = std::env::var_os("DOOM_WAD") else {
+        println!("DOOM_WAD is unset; skipping the real-WAD sprite test");
+        return;
+    };
+    let wad = Wad::open(&path).expect("open the WAD");
+    let sprites = wad.sprites();
+    // Every IWAD has the imp, its fireball and the chaingun.
+    for rotation in 1..=8 {
+        let lump = sprites.get("TROO", b'A', rotation).expect("TROOA");
+        assert_eq!(lump.mirrored, rotation > 5, "TROOA{rotation}: {lump:?}");
+    }
+    assert!(sprites.rotates("TROO", b'A'));
+    assert!(!sprites.rotates("BAL1", b'A'));
+    for (prefix, frame) in [
+        ("BAL1", b'C'),
+        ("CHGG", b'B'),
+        ("CHGF", b'A'),
+        ("BEXP", b'E'),
+    ] {
+        let lump = sprites.get(prefix, frame, 0).expect(prefix);
+        let patch = wad.patch(&lump.name).expect("decodes");
+        assert!(patch.picture.width > 0 && patch.picture.height > 0);
+    }
+    let names = sprites.lump_names();
+    println!(
+        "{} sprite lumps, {} sprites",
+        names.len(),
+        sprites.prefixes().count()
+    );
+    for name in names {
+        wad.patch(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}

@@ -2,7 +2,9 @@
 
 An experiment: vanilla DOOM maps from a WAD file, shown as a
 [`bevy_voxel_world`](https://github.com/splashdust/bevy_voxel_world) voxel
-world you can fly through. Every voxel is one colour from DOOM's palette, with
+world you walk through and fight DOOM's monsters in, with a chaingun that
+blows chunks out of the world. It is there to play-test whether a
+destructible world adds fun. Every voxel is one colour from DOOM's palette, with
 DOOM's sector light baked in, drawn flat and unlit so the map reads as it does
 in DOOM. With `--light propagated` the crate's light propagation lights it
 instead, from the sky and from DOOM's light fixtures, and with `--light
@@ -12,9 +14,9 @@ The workspace has three parts:
 
 | | |
 |---|---|
-| `crates/wad` (`doom_wad`) | reads WAD files: map lumps, the palette, COLORMAP, flats and wall textures |
+| `crates/wad` (`doom_wad`) | reads WAD files: map lumps, the palette, COLORMAP, flats, wall textures, sprites and sounds |
 | `crates/voxelize` (`doom_voxelize`) | turns one map into voxels: `VoxelMap` |
-| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the fly camera |
+| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things |
 
 ## Running
 
@@ -38,10 +40,13 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | | |
 |---|---|
 | mouse | look (the cursor is captured) |
-| W A S D | fly forward, back, left, right |
-| Space / Ctrl | up / down |
-| Shift | three times faster |
+| W A S D | walk forward, back, left, right; in fly mode, fly |
+| Shift | run; in fly mode, three times faster |
+| Space | jump; in fly mode, up |
+| Ctrl | in fly mode, down |
 | left click | fire; hold for a chaingun's rate. The click that captures the cursor doesn't fire |
+| V | switch between walking and the noclip fly camera |
+| R or click | when dead, respawn at the start with full health |
 | Esc | free the cursor; click to capture it again |
 
 ## Command line
@@ -67,10 +72,18 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--flash-time S` | how long a shot's flash glows, 0.12 s by default. A long time keeps flashes on for a screenshot |
 | `--no-vsync` | don't wait for the display, so the HUD's frame rate shows what a frame costs |
 | `--closed-doors` | keep door sectors closed; they are baked open by default |
-| `--pos X,Y,Z` | start the camera here, in voxels, instead of at player 1's start |
+| `--fly` | start in the noclip fly camera instead of walking; V switches |
+| `--god` | take no damage |
+| `--awake` | monsters start awake, chasing the player |
+| `--freeze` | things stand still and don't think, for screenshots |
+| `--mute` | no sound |
+| `--list-things` | print where each monster stands, in voxels |
+| `--frame-times` | every 5 seconds print frame time statistics and where the monster tics spend their time |
+| `--script STEPS` | once the world has settled, play comma-separated steps: `w:S`, `s:S`, `a:S`, `d:S` walk for S seconds (capitals run), `jw:S` jump while walking, `jump`, `turn:DEG` (positive left), `pitch:DEG`, `fire:N` shots, `wait:S`, `shot:PATH` save a screenshot, `respawn`. Each step prints the player's position. The cursor isn't captured, and `--screenshot` waits for the script |
+| `--pos X,Y,Z` | start the camera (the eye, when walking) here, in voxels, instead of at player 1's start |
 | `--yaw DEG` | start yaw: 0 faces DOOM's north, positive turns left |
 | `--pitch DEG` | start pitch, positive looks up |
-| `--blast-radius R` | the radius in voxels of the ball a shot carves, 4 by default |
+| `--blast-radius R` | the radius in voxels of the ball the player's shots carve, 4 by default |
 | `--fire N` | once the world is ready, fire N shots in a small spiral around the view centre |
 | `--screenshot PATH` | wait until the world in view has been generated and meshed, and its light has settled, save a PNG and exit. With `--fire`, it waits for the carved chunks too |
 | `--quit-after S` | exit after S seconds |
@@ -149,16 +162,112 @@ its north is −z.
   no chunk spawning or despawning, or two minutes at most. `--fire` waits
   for the same signal before its first shot, and each shot starts the count
   again. In a lit world each shot prints how long its light took to land.
-- **The weapon.** A shot is a ray from the camera along its forward vector,
-  through `VoxelWorld::raycast`, out to the view distance. Around the voxel
-  it hits, `set_voxels_in` carves a ball whose edge is jittered by a hash of
-  each voxel's position, and darkens solid voxels in a shell 1.5 voxels
-  thick outside it by a few COLORMAP tables. The darkening starts from the
-  colour `VoxelMap::voxel` gives, so shooting the same spot again doesn't
-  darken it further, and a scorched lamp goes out. Air is never made solid,
-  except for a shot's flash, which rays pass through. The scripted shots of
-  `--fire` are spread so the craters sit side by side at the distance the
-  centre ray hits.
+- **The player** (`src/player.rs`, `src/collide.rs`). The player is
+  DOOM's: a box 32 map units across and 56 tall, the eye at 41, stepping up
+  ledges of up to 24 units, so 16 × 28 voxels with a 12-voxel step at 2
+  units per voxel. The collision is kinematic code, no physics engine. A
+  move goes in substeps of under half a voxel, x, then z, then y. A
+  horizontal substep looks only at the slab of voxels the box's leading
+  face enters: if that slab is solid only within a step of the feet and the
+  box fits on top, the player steps up, otherwise it stops at the voxel
+  boundary and the other axes carry on, so it slides along walls. A
+  vertical substep looks at the row under the feet or over the head. So no
+  speed tunnels through a one-voxel wall, and voxels that end up inside the
+  box are ignored, so the player can walk out of them. Voxels come from
+  `VoxelMap::is_solid` in chunks without edits, and from
+  `VoxelWorld::get_voxel` in chunks with edits, falling back to the map
+  where it has nothing, so craters and anything else that edits the world
+  collide. Shot flashes count as air. Things that block (monsters, solid
+  decorations) stop a move along an axis that would end overlapping them
+  and no farther away. Movement uses DOOM's numbers: walking and running
+  speeds of 8.3 and 16.7 units a tic, reached and lost at the rate of
+  DOOM's friction, and its gravity of 1 unit a tic a tic. The player barely
+  steers in the air. DOOM has no jump; Space jumps about 32 units, which
+  with the step climbs out of most craters. After a step up the eye catches
+  up over a few frames, as DOOM's view height does. Health is 100; at 0 the
+  view sinks and turns red until R or a click respawns at the start.
+- **Sprites** (`crates/wad/src/sprite.rs`, `src/sprites.rs`). The WAD
+  reader lists the sprite lumps between `S_START` and `S_END` (and the
+  `SS_` markers) by prefix, frame letter and rotation, a second
+  letter-and-rotation pair naming the same lump mirrored, and the patch
+  decoder decodes them. Every thing is a quad turned about y to face the
+  camera. Its rotation comes from r_things.c: the angle from the camera to
+  the thing less the thing's facing picks one of eight 45° sectors. The
+  quad sits where DOOM draws the patch, from its left and top offsets, one
+  patch pixel to a map unit. Colours are worked out on the CPU: each
+  texel's palette index goes through the COLORMAP table that walls of the
+  thing's sector take at the distance the map is baked for, stretched by
+  `--contrast` (`VoxelMap::sprite_table`), then the colour gain, so things
+  are as dark as the room they stand in. Full-bright frames skip the table.
+  Each lump, table and mirroring is one image and one unlit, alpha-masked
+  material, made the first time it shows. The spectre is drawn dark and
+  see-through instead of DOOM's fuzz. The chaingun is drawn at the bottom
+  centre as DOOM draws weapon sprites on a 320×200 screen, scaled to the
+  window with DOOM's tall pixels, bobbing as the player walks, in the
+  light of the player's sector, its flash full-bright.
+- **Monsters** (`src/info.rs`, `src/actors.rs`). Things spawn from THINGS
+  at skill 3 (flag 2), single player only. Monsters and the barrel run at
+  DOOM's 35 tics a second in `FixedUpdate`, drawn between tics. Each
+  monster type carries DOOM's numbers from info.c (health, speed, radius,
+  height, mass, pain chance) and its state sequences (spawn, see, melee,
+  missile, pain, death, gib) with DOOM's frame letters, durations and
+  actions, which follow p_enemy.c:
+  - a monster in its spawn frames looks for the player: it wakes when it
+    sees them in front of it, or close behind, or hears them fire within
+    1024 units (an ambush monster must see them too). Sight is a voxel line
+    trace from three quarters up the monster to the player's eye, so a hole
+    shot through a wall lets monsters see through it. Traces run in
+    parallel, every few tics per monster;
+  - awake, it chases as A_Chase does: it turns 45° a step toward the
+    direction it moves in, keeps a direction for a random count of steps,
+    and picks a new one as P_NewChaseDir does, the diagonal toward the
+    player first, then the straight directions, its old one, then any,
+    trying each with a short trial move through the same collision as the
+    player's. Monsters step up 24 units, fall where the floor is gone,
+    and block each other and the player, so they don't stack;
+  - it attacks with DOOM's odds (P_CheckMeleeRange, P_CheckMissileRange):
+    hitscanners fire DOOM's bullets, spread as DOOM spreads them, tested
+    against the player's and other monsters' bodies before the world, and
+    a bullet that misses digs a pit 1 voxel across in what it hits; melee
+    attackers claw and bite in DOOM's range; the imp, cacodemon, baron,
+    hell knight, revenant, mancubus and arachnotron fire DOOM's
+    projectiles at DOOM's speeds and damage, which burst on things and dig
+    a crater 3 voxels across in the world;
+  - damage pushes things away as DOOM's thrust does, sends them into pain
+    at their pain chance, wakes them when the player did it, and kills
+    them: death or gib frames, a corpse that isn't solid and falls if the
+    floor goes.
+- **The weapon** (`src/weapon.rs`). A shot is a ray from the camera along
+  its forward vector, spread after the first shot of a burst as DOOM's
+  refire is. It hits the first monster or barrel whose body it crosses,
+  for DOOM's 5 × (1 to 3), leaving blood, or else carves the world within
+  the view distance, leaving a puff. `Carver::carve` does every carve in
+  the app, the player's shots, monsters' bullets and projectiles and
+  barrels alike: around the voxel hit, `set_voxels_in` carves a ball whose
+  edge is jittered by a hash of each voxel's position, and darkens solid
+  voxels in a shell 1.5 voxels thick outside it by a few COLORMAP tables.
+  It returns the voxels it emptied with their materials, for anything that
+  wants to react to destruction. The darkening starts from the colour
+  `VoxelMap::voxel` gives, so carving the same spot again doesn't darken
+  it further, and a scorched lamp goes out. Air is never made solid,
+  except for a shot's flash, which rays and bodies pass through. The
+  scripted shots of `--fire` are spread so the craters sit side by side at
+  the distance the centre ray hits.
+- **Barrels.** A barrel is a thing with 20 health that never wakes. Shot
+  dead, it plays DOOM's explosion and blasts everything it can see within
+  128 units for 128 less the distance, as P_RadiusAttack does, which can
+  set off other barrels, then carves a crater 11 voxels in radius.
+- **Items.** Decorations and items stand as billboards, animated and lit
+  like monsters; solid ones block. Only health is picked up: the
+  stimpack, the medikit and the health bonus, with DOOM's amounts and
+  limits. Ammo is unlimited.
+- **Sound** (`crates/wad/src/sound.rs`, `src/sound.rs`). The `DS` lumps are
+  DMX sounds, turned into in-memory WAVs at start and played through
+  bevy_audio: the gun, monsters' sight, attack, pain, death and active
+  sounds, projectiles and their bursts, barrels, the player's pain and
+  death, and pickups. Volume falls off with distance as DOOM's does, full
+  within 200 units and silent past 1200, with at most a dozen sounds at
+  once.
 - **The voxelizer** (`crates/voxelize`). At import every voxel column gets its
   sector from the map's BSP, with a nearest-linedef test for the void outside
   the map. A voxel is solid below its sector's floor, air up to the ceiling
@@ -187,8 +296,6 @@ its north is −z.
   DOOM would paint sky above them.
 - Animated flats and textures, and switches, show their first frame.
 - Doors, lifts and crushers don't move.
-- No things: monsters, items and decorations aren't shown, except the
-  pillars that stand in for light-giving things in the light modes.
 - Propagated light is white: a red torch lights its alcove white. And it
   reaches 32 voxels at most, 64 map units at 2 units per voxel, so a lamp
   lights a pool beside it and most of a big room stays at `--min-light`.
@@ -212,11 +319,11 @@ its north is −z.
   carries it about twice as far, and lets every bright sector's light
   spread twice as far into its darker neighbours.
 - Pillars stand where the thing's centre is, cut off by walls and ceilings,
-  and don't block shots any differently from walls.
+  and don't block shots any differently from walls. In the light modes the
+  light-giving thing's sprite stands in its pillar.
 - With the camera close to a wall only a few chunks spawn, and the light
   beside a lamp in the next chunk can read black until more of the room
   spawns, though `light_is_settled` says it has settled.
-- No collision: the camera only flies.
 - With `--closed-doors`, the bottom face of a closed door shows the ceiling
   flat instead of the door texture.
 - Inside the solid, each column takes one neighbouring sector, so where two
@@ -224,6 +331,41 @@ its north is −z.
   top of the world over non-sky ceilings stays black.
 - Shots pass through the transparent holes of grates, and nothing is
   thrown out of a crater. Craters aren't saved.
+- Monsters approximated: the Wolfenstein SS fires the chaingunner's
+  bullets; the revenant's rocket turns toward the player every 4 tics at
+  DOOM's turn rate but leaves no smoke, and its fist uses the plain melee
+  range; the mancubus's three volleys are two fireballs each at roughly
+  DOOM's spreads; the arachnotron's refire uses the chaingunner's action
+  with its own odds; fliers (cacodemon, lost soul) step over anything up
+  to 32 units instead of DOOM's float climb, and rise and sink toward the
+  player as DOOM's do; the lost soul's charge hurts what it runs into,
+  found from what blocked it.
+- Monsters skipped: the arch-vile, pain elemental, spider mastermind,
+  cyberdemon, Commander Keen and the boss brain stand in their first
+  frame and do nothing, and can't be shot.
+- No infighting: monsters hurt each other with bullets and projectiles
+  (a projectile doesn't hurt its own species), but the one hurt doesn't
+  turn on the one that hurt it.
+- Monsters walk off ledges of any height, where DOOM's won't step down
+  more than 24 units, and nothing opens doors.
+- Melee range, barrel blasts and pickups measure across the floor as DOOM
+  does, plus a vertical limit, so a monster can't claw through a floor.
+  Sight is one trace eye to eye; DOOM's REJECT table isn't used.
+- Projectiles are points against the world; against bodies, the bodies
+  grow by the projectile's radius. A projectile that misses the player
+  aims at their feet, so its crater lands near where they stood.
+- Things are lit by the sector of the column they stand in, at one
+  baked distance, and in `propagated` and `flat` they are full-bright:
+  propagated light doesn't reach them. The gun's flash doesn't light the
+  world, as DOOM's extra light does.
+- Billboards turn only about y, so seen from steeply above or below they
+  look thin. The spectre is dark and see-through rather than DOOM's fuzz.
+- Only health is picked up; keys, armour, weapons and ammo are only
+  shown. There is one weapon and no status bar, only the health number.
+  The skill is fixed at 3. The gun isn't shown in fly mode.
+- The player aims with the crosshair, without DOOM's vertical autoaim;
+  monsters aim their hitscans and projectiles at the player directly,
+  spread only sideways as DOOM spreads them.
 
 ## Which bevy_voxel_world
 
@@ -328,6 +470,25 @@ work around:
 - **No "edits have remeshed" signal.** Waiting for a screenshot after a shot
   reuses the settling heuristic above: chunks the shot touched turn
   `Pending` and back to `Ready`.
+- **No cheap solid read.** `get_voxel` checks pending edits, takes the
+  committed edits' lock and the chunk map's lock and does several hash
+  lookups per voxel. A body's move reads hundreds of voxels a substep, a
+  sight line a voxel per step, so the app reads `VoxelMap::is_solid` in
+  chunks without edits and goes through the voxel world only in edited
+  ones, which it learns from `edited_chunks()`. That allocates a list of
+  every edited chunk on each call and holds only committed edits, so an
+  edit collides from the frame after. A per-chunk "has edits" check, or a
+  read of a box of voxels at once, would make this simpler and faster.
+- **No collision or ranged traces.** The upright-box sweep against the
+  grid, with step-up and sliding, is the app's own, and so is a voxel line
+  trace with a maximum distance, since `raycast` traces to the edge of the
+  published chunks and reads every voxel through `get_voxel`. A swept box
+  query and a ranged trace over a caller's solid test would be reusable
+  by every game on the crate.
+- **What a carve removed.** `set_voxels_in` doesn't say what each voxel
+  was, so collecting the voxels a carve emptied, for debris, reads them
+  through `get_voxel_fn` inside the closure, with the map as the fallback
+  for unpublished chunks.
 - **LOD would lose thin walls.** A coarse level samples every `1 << L`th
   voxel, so one-voxel walls and steps vanish or flicker between levels. The
   app uses no LOD, so the view distance is bounded by the chunk count.

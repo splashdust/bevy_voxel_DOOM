@@ -1,5 +1,5 @@
 //! Reads vanilla DOOM WAD files: the map lumps, palette 0 of PLAYPAL,
-//! COLORMAP, flats and composite wall textures.
+//! COLORMAP, flats, composite wall textures, sprites and sound effects.
 //!
 //! Every name (lump, texture, flat) is stored upper-case with trailing NULs
 //! removed, so lookups compare upper-case strings.
@@ -11,9 +11,13 @@ mod bytes;
 mod directory;
 mod map;
 mod picture;
+mod sound;
+mod sprite;
 mod texture;
 
 pub use picture::{decode_patch, Patch};
+pub use sound::Sound;
+pub use sprite::{SpriteFrame, SpriteLump, SpriteSet};
 pub use texture::SkippedTexture;
 
 #[derive(Debug)]
@@ -64,6 +68,11 @@ impl Wad {
         let name = name.to_ascii_uppercase();
         let e = self.entries.iter().rev().find(|e| e.name == name)?;
         Some(self.entry_data(e))
+    }
+
+    /// Every lump's name, in directory order.
+    pub fn lump_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.name.as_str())
     }
 
     /// The names of the maps in the WAD, `E1M1` or `MAP01` style, in directory order.

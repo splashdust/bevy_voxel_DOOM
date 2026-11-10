@@ -120,6 +120,10 @@ impl VoxelMap {
                 floor_flat: flat_ids.id(&sec.floor_flat, &textures.flats),
                 ceiling_flat: flat_ids.id(&sec.ceiling_flat, &textures.flats),
                 flat_table: table(light::flat_table(sec.light)),
+                sprite_table: light::stretch(
+                    light::wall_table(sec.light, 0),
+                    options.contrast,
+                ) + 1,
                 lamp_level: lamps::sector_level(options.lamps, sec.light),
                 flat_glow: glow(light::flat_table(sec.light)),
             })

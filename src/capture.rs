@@ -34,6 +34,48 @@ pub struct CapturePlugin {
     pub quit_after: Option<f32>,
     /// Track [`WorldSettled`] even without a screenshot.
     pub track_settling: bool,
+    /// Print frame time statistics every few seconds.
+    pub frame_times: bool,
+}
+
+/// Frame times since the last report, in milliseconds.
+#[derive(Resource, Default)]
+struct FrameTimes {
+    frames: Vec<f32>,
+    since: f32,
+}
+
+/// Seconds between frame time reports.
+const FRAME_TIME_REPORT: f32 = 5.0;
+
+fn record_frame_times(
+    time: Res<Time<Real>>,
+    mut times: ResMut<FrameTimes>,
+    actors: Query<&crate::actors::Actor>,
+    mut profile: ResMut<crate::actors::TicProfile>,
+) {
+    let dt = time.delta_secs();
+    times.frames.push(dt * 1000.0);
+    times.since += dt;
+    if times.since < FRAME_TIME_REPORT {
+        return;
+    }
+    let (alive, awake) = crate::actors::census(&actors);
+    let mut frames = std::mem::take(&mut times.frames);
+    times.since = 0.0;
+    frames.sort_by(f32::total_cmp);
+    let at = |q: f32| frames[((frames.len() - 1) as f32 * q) as usize];
+    let mean = frames.iter().sum::<f32>() / frames.len() as f32;
+    println!(
+        "frame times at {:.0} s over {} frames, {alive} monsters, {awake} awake: mean {mean:.1} ms, p50 {:.1}, p95 {:.1}, p99 {:.1}, worst {:.1}",
+        time.elapsed_secs(),
+        frames.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        at(1.0)
+    );
+    println!("  {}", profile.report());
 }
 
 /// Whether the world around the camera has settled: every spawned chunk
@@ -94,6 +136,10 @@ impl Plugin for CapturePlugin {
             })
             .init_resource::<ShotSaved>()
             .add_systems(Update, take_screenshot.in_set(CaptureSet::Shoot));
+        }
+        if self.frame_times {
+            app.init_resource::<FrameTimes>()
+                .add_systems(Last, record_frame_times);
         }
         if let Some(seconds) = self.quit_after {
             app.add_systems(

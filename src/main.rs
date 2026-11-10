@@ -1,11 +1,18 @@
-//! doom_voxels: a vanilla DOOM map from a WAD file, shown as a
-//! `bevy_voxel_world` voxel world with a fly camera. See `args::USAGE` for
-//! the flags.
+//! doom_voxels: a vanilla DOOM map from a WAD file as a `bevy_voxel_world`
+//! voxel world you walk through, with DOOM's monsters. See `args::USAGE`
+//! for the flags.
 
+mod actors;
 mod args;
 mod camera;
 mod capture;
+mod collide;
 mod hud;
+mod info;
+mod input;
+mod player;
+mod sound;
+mod sprites;
 mod weapon;
 mod world;
 
@@ -18,7 +25,8 @@ use doom_wad::Wad;
 
 use crate::camera::CameraStart;
 use crate::hud::MapLabel;
-use crate::world::DoomWorldPlugin;
+use crate::player::{Mode, PlayerStart};
+use crate::world::{DoomWorldPlugin, GameMap};
 
 fn main() -> AppExit {
     let args = args::parse();
@@ -64,6 +72,9 @@ fn main() -> AppExit {
         eprintln!("error: can't build {map_name}: {e}");
         std::process::exit(1);
     });
+    let things = wad.map(&map_name).map(|m| m.things).unwrap_or_default();
+    let sprites = sprites::SpriteBank::load(&wad);
+    let sounds = (!args.mute).then(|| sound::SoundBank::load(&wad));
     drop(wad);
     let (min, max) = map.bounds();
     println!(
@@ -85,6 +96,7 @@ fn main() -> AppExit {
 
     let (spawn, spawn_yaw) = map.spawn();
     let map = Arc::new(map);
+    let s = args.units_per_voxel as f32;
     let start = CameraStart {
         position: args.pos.unwrap_or(Vec3::from_array(spawn)),
         yaw: args.yaw.map_or(spawn_yaw, f32::to_radians),
@@ -92,9 +104,25 @@ fn main() -> AppExit {
         speed: CameraStart::speed_for(args.units_per_voxel),
         view_distance: world::view_distance_voxels(args.units_per_voxel),
     };
+    let player_start = PlayerStart {
+        feet: start.position - Vec3::Y * player::EYE / s,
+        yaw: start.yaw,
+        mode: if args.fly { Mode::Fly } else { Mode::Walk },
+        god: args.god,
+        units: s,
+    };
     let [r, g, b] = map.sky_colour();
-    let capturing = args.screenshot.is_some();
+    let capturing = args.screenshot.is_some() || args.script.is_some();
     let flash = args.light.propagated().then(|| world::flash_material(&map));
+    let game_map = GameMap {
+        map: Arc::clone(&map),
+        flash,
+        units: s,
+        sector_light: matches!(
+            args.light,
+            args::LightMode::Sector | args::LightMode::Both | args::LightMode::SectorGlow
+        ),
+    };
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -121,18 +149,30 @@ fn main() -> AppExit {
     .add_plugins(capture::CapturePlugin {
         screenshot: args.screenshot.clone(),
         quit_after: args.quit_after,
-        track_settling: args.fire > 0,
+        track_settling: args.fire > 0 || args.script.is_some(),
+        frame_times: args.frame_times,
     })
     .add_plugins(weapon::WeaponPlugin {
-        map,
         radius: args.blast_radius,
         range: world::view_distance_voxels(args.units_per_voxel),
         scripted_shots: args.fire,
-        flash,
         flash_time: args.knobs.flash_time,
     })
+    .add_plugins(actors::ActorsPlugin {
+        things,
+        awake: args.awake,
+        print: args.list_things,
+        freeze: args.freeze,
+    })
+    .add_plugins(sound::SoundPlugin { bank: sounds })
     .insert_resource(ClearColor(Color::srgb_u8(r, g, b)))
     .insert_resource(start)
+    .insert_resource(player_start)
+    .insert_resource(game_map)
+    .insert_resource(sprites)
+    .init_resource::<world::EditedChunks>()
+    .init_resource::<player::Blockers>()
+    .init_resource::<input::Intent>()
     .insert_resource(MapLabel {
         name: map_name,
         units_per_voxel: args.units_per_voxel,
@@ -140,11 +180,38 @@ fn main() -> AppExit {
     })
     .add_systems(
         Startup,
-        (camera::spawn_camera, hud::spawn_hud, hud::spawn_crosshair),
+        (
+            camera::spawn_camera,
+            hud::spawn_hud,
+            hud::spawn_crosshair,
+            sprites::setup_sprites,
+        ),
     )
     .add_systems(
         Update,
-        (camera::grab_cursor, camera::fly, hud::update_hud).chain(),
+        (
+            input::read_devices,
+            camera::grab_cursor,
+            camera::look,
+            camera::fly,
+            world::track_edited_chunks,
+            player::walk,
+        )
+            .chain(),
+    )
+    .add_systems(
+        Update,
+        (sprites::draw_billboards, hud::update_hud, hud::draw_gun).after(player::walk),
     );
+    if let Some(steps) = args.script.clone() {
+        app.insert_resource(input::Script::new(steps)).add_systems(
+            Update,
+            input::run_script
+                .after(input::read_devices)
+                .before(camera::look)
+                .after(capture::CaptureSet::Track)
+                .before(capture::CaptureSet::Shoot),
+        );
+    }
     app.run()
 }

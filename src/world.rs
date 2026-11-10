@@ -8,6 +8,7 @@ use bevy::{
     asset::uuid_handle,
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey},
+    platform::collections::HashSet,
     prelude::*,
     render::render_resource::{
         AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
@@ -22,6 +23,7 @@ use bevy_voxel_world::{
 use doom_voxelize::{Voxel, VoxelMap};
 
 use crate::args::{LightKnobs, LightMode};
+use crate::collide::Solid;
 
 /// How far chunks spawn, in DOOM map units: a long DOOM sightline.
 const VIEW_DISTANCE_UNITS: i32 = 2048;
@@ -162,6 +164,82 @@ fn falloff_curve(base: f32) -> LevelCurve {
     }
     let floor = base.powi(15);
     LevelCurve::from_fn(|level| (base.powi(15 - level as i32) - floor) / (1.0 - floor))
+}
+
+/// The map the world is built from, shared by everything that reads it.
+#[derive(Resource, Clone)]
+pub struct GameMap {
+    pub map: Arc<VoxelMap>,
+    /// The material of a shot's flash, in the light modes that have one.
+    pub flash: Option<u16>,
+    /// DOOM map units per voxel.
+    pub units: f32,
+    /// Things are drawn in their sector's light, as the world is.
+    pub sector_light: bool,
+}
+
+/// The level-0 chunks with voxel edits, as of the last commit; see
+/// [`WorldSolid`].
+#[derive(Resource, Default, Clone)]
+pub struct EditedChunks(pub Arc<HashSet<IVec3>>);
+
+/// Refreshes [`EditedChunks`] when the edits have changed.
+pub fn track_edited_chunks(
+    voxel_world: VoxelWorld<DoomWorld>,
+    mut edited: ResMut<EditedChunks>,
+    mut last: Local<(usize, u64)>,
+) {
+    let chunks = voxel_world.edited_chunks();
+    let stamp = (chunks.len(), chunks.iter().map(|(_, seq)| seq).sum());
+    if stamp != *last {
+        *last = stamp;
+        edited.0 = Arc::new(chunks.into_iter().map(|(p, _)| p).collect());
+    }
+}
+
+/// What bodies, sight lines and shots collide with: the voxel world's
+/// voxels, edits included, with flashes counting as air.
+///
+/// A chunk without edits holds just what the map generates, so its voxels
+/// come from [`VoxelMap::is_solid`], which is much cheaper than
+/// `VoxelWorld::get_voxel`. Only voxels in edited chunks go through the
+/// voxel world, falling back to the map where it has nothing.
+#[derive(Clone)]
+pub struct WorldSolid {
+    map: Arc<VoxelMap>,
+    edited: Arc<HashSet<IVec3>>,
+    get: Arc<dyn Fn(IVec3) -> WorldVoxel<u16> + Send + Sync>,
+    flash: Option<u16>,
+}
+
+impl WorldSolid {
+    pub fn new(
+        voxel_world: &VoxelWorld<DoomWorld>,
+        map: &GameMap,
+        edited: &EditedChunks,
+    ) -> Self {
+        WorldSolid {
+            map: Arc::clone(&map.map),
+            edited: Arc::clone(&edited.0),
+            get: voxel_world.get_voxel_fn(),
+            flash: map.flash,
+        }
+    }
+}
+
+impl Solid for WorldSolid {
+    fn solid(&self, p: IVec3) -> bool {
+        if !self
+            .edited
+            .contains(&p.div_euclid(IVec3::splat(CHUNK_SIZE_I)))
+        {
+            return self.map.is_solid(p.to_array());
+        }
+        match (self.get)(p) {
+            WorldVoxel::Unset => self.map.is_solid(p.to_array()),
+            voxel => voxel.is_solid() && Some(voxel) != self.flash.map(WorldVoxel::Solid),
+        }
+    }
 }
 
 /// Light texture slots: a long DOOM sightline loads thousands of mixed

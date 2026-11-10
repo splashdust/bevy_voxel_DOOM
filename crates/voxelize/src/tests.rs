@@ -836,3 +836,31 @@ fn surfaces_glow_at_the_level_of_the_table_they_are_drawn_in() {
         }
     );
 }
+
+#[test]
+fn is_solid_agrees_with_voxel() {
+    for m in [build(true, false), build_lamps(Some(LampLevel::Full), true)] {
+        let (min, max) = m.bounds();
+        for x in min[0] - 2..max[0] + 2 {
+            for y in min[1] - 2..max[1] + 2 {
+                for z in min[2] - 2..max[2] + 2 {
+                    let p = [x, y, z];
+                    assert_eq!(m.is_solid(p), m.voxel(p).is_solid(), "{p:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn things_take_their_sectors_light() {
+    // Light 160 (level 10): a wall without fake contrast is table 10, and
+    // tables are offset by one for the identity at 0.
+    let m = build(true, true);
+    let (x, z) = col(65, 65);
+    assert_eq!(m.sprite_table(x, z), 1 + 10);
+    assert_eq!(m.sprite_table(-1000, -1000), 0);
+    // The test colormap adds the table number.
+    assert_eq!(m.lit(7, 1 + 10), 7 + 10);
+    assert_eq!(m.lit(7, 0), 7);
+}

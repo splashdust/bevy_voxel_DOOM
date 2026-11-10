@@ -125,6 +125,9 @@ struct SectorInfo {
     ceiling_flat: u16,
     /// The light table for its flats.
     flat_table: u8,
+    /// The light table for things in it: walls' without fake contrast,
+    /// stretched by contrast whether or not sector light is baked in.
+    sprite_table: u8,
     /// The emission level of its glowing flats and walls, 0 for none.
     lamp_level: u8,
     /// With sector glow, the level its floor and ceiling glow at; else 0.
@@ -246,6 +249,34 @@ impl VoxelMap {
         Voxel::Solid(self.interior(near, sector, p))
     }
 
+    /// Whether the voxel at `p` is solid: `voxel(p).is_solid()`, without
+    /// working out its colour. Collision and sight lines call it per voxel.
+    pub fn is_solid(&self, p: [i32; 3]) -> bool {
+        let [x, y, z] = p;
+        if y >= self.max[1] {
+            return false;
+        }
+        if y < self.min[1] {
+            return true;
+        }
+        let Some(col) = self.column(x, z) else {
+            return true;
+        };
+        let sector = self.columns[col];
+        if sector == VOID {
+            return true;
+        }
+        let sec = &self.sectors[sector as usize];
+        if y >= sec.floor_v && (sec.sky || y < sec.ceiling_v) {
+            let line = self.lines[col];
+            if line & MASKED != 0 {
+                return self.masked(line & !MASKED, x, y, z).is_solid();
+            }
+            return self.lamps.pillar(col, y).is_some();
+        }
+        true
+    }
+
     /// `Some(v)` when every voxel in the box `min..max` (max exclusive) is
     /// known to be `v` without visiting them; `None` when it may vary. Must
     /// be cheap: the app calls it once per chunk to skip generating uniform
@@ -350,6 +381,24 @@ impl VoxelMap {
     pub fn column_sector(&self, x: i32, z: i32) -> Option<u16> {
         let s = self.columns[self.column(x, z)?];
         (s != VOID).then_some(s)
+    }
+
+    /// The light table things standing in column `(x, z)` are drawn in, for
+    /// [`VoxelMap::lit`]: DOOM's sprite light for the column's sector at the
+    /// distance the map is baked for, stretched by [`Options::contrast`].
+    /// 0, full-bright, for the void. Meant to go with
+    /// [`VoxelMap::colour_gain`] as the world's colours do, so with sector
+    /// light off the gain is 1 and a caller wanting full-bright things uses
+    /// table 0.
+    pub fn sprite_table(&self, x: i32, z: i32) -> u8 {
+        self.column_sector(x, z)
+            .map_or(0, |s| self.sectors[s as usize].sprite_table)
+    }
+
+    /// Palette index `index` in light table `table`: 0 is full-bright and
+    /// `1 + k` COLORMAP table `k`, from 0 brightest to 31 darkest.
+    pub fn lit(&self, index: u8, table: u8) -> u8 {
+        self.tables[(table as usize).min(self.tables.len() - 1)][index as usize]
     }
 
     /// The air span of column `(x, z)` in voxels, `floor..ceiling`, with the

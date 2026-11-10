@@ -1,21 +1,21 @@
-//! The fly camera: mouse look with the cursor captured, WASD, Space and Ctrl
-//! up and down, Shift faster. Esc frees the cursor; a click captures it again.
+//! The camera: mouse look with the cursor captured, and the noclip fly
+//! mode, WASD, Space and Ctrl up and down, Shift faster. Esc frees the
+//! cursor; a click captures it again. Walking is `player`'s.
 
 use bevy::{
-    input::mouse::AccumulatedMouseMotion,
     prelude::*,
     render::view::{DebandDither, Tonemapping},
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
 use bevy_voxel_world::prelude::*;
 
+use crate::input::Intent;
+use crate::player::{Mode, Player};
 use crate::world::DoomWorld;
 
-/// Walking speed in DOOM map units per second, about DOOM's running speed.
+/// Flying speed in DOOM map units per second, about DOOM's running speed.
 const SPEED_UNITS: f32 = 300.0;
 const SHIFT_FACTOR: f32 = 3.0;
-/// Radians per pixel of mouse motion.
-const MOUSE_SENSITIVITY: f32 = 0.0022;
 /// Vertical field of view: about 90° across in a 16:10 window.
 const FOV_DEGREES: f32 = 64.0;
 
@@ -30,7 +30,7 @@ pub struct FlyCamera {
 }
 
 impl FlyCamera {
-    fn rotation(&self) -> Quat {
+    pub fn rotation(&self) -> Quat {
         Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0)
     }
 }
@@ -51,7 +51,11 @@ impl CameraStart {
     }
 }
 
-pub fn spawn_camera(mut commands: Commands, start: Res<CameraStart>) {
+pub fn spawn_camera(
+    mut commands: Commands,
+    start: Res<CameraStart>,
+    player: Res<crate::player::PlayerStart>,
+) {
     let fly = FlyCamera {
         yaw: start.yaw,
         pitch: start.pitch,
@@ -70,6 +74,7 @@ pub fn spawn_camera(mut commands: Commands, start: Res<CameraStart>) {
         DebandDither::Disabled,
         Transform::from_translation(start.position).with_rotation(fly.rotation()),
         fly,
+        Player::new(&player),
         VoxelWorldCamera::<DoomWorld>::default(),
     ));
 }
@@ -98,42 +103,32 @@ pub fn grab_cursor(
     }
 }
 
+/// Turns the camera as the mouse or script says.
+pub fn look(intent: Res<Intent>, camera: Single<(&mut FlyCamera, &mut Transform)>) {
+    let (mut fly, mut transform) = camera.into_inner();
+    fly.yaw += intent.turn;
+    fly.pitch = intent
+        .set_pitch
+        .unwrap_or(fly.pitch + intent.look_up)
+        .clamp(-1.55, 1.55);
+    transform.rotation = fly.rotation();
+}
+
+/// Flies the camera through walls, in fly mode.
 pub fn fly(
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    motion: Res<AccumulatedMouseMotion>,
-    cursor: Single<&CursorOptions, With<PrimaryWindow>>,
-    camera: Single<(&mut FlyCamera, &mut Transform)>,
+    intent: Res<Intent>,
+    camera: Single<(&FlyCamera, &mut Transform, &Player)>,
 ) {
-    let (mut fly, mut transform) = camera.into_inner();
-    if cursor.grab_mode != CursorGrabMode::None {
-        fly.yaw -= motion.delta.x * MOUSE_SENSITIVITY;
-        fly.pitch = (fly.pitch - motion.delta.y * MOUSE_SENSITIVITY).clamp(-1.55, 1.55);
+    let (fly, mut transform, player) = camera.into_inner();
+    if player.mode != Mode::Fly {
+        return;
     }
-    transform.rotation = fly.rotation();
-
-    let mut direction = Vec3::ZERO;
-    let pressed = |key| keys.pressed(key);
-    if pressed(KeyCode::KeyW) {
-        direction += *transform.forward();
-    }
-    if pressed(KeyCode::KeyS) {
-        direction -= *transform.forward();
-    }
-    if pressed(KeyCode::KeyD) {
-        direction += *transform.right();
-    }
-    if pressed(KeyCode::KeyA) {
-        direction -= *transform.right();
-    }
-    if pressed(KeyCode::Space) {
-        direction += Vec3::Y;
-    }
-    if pressed(KeyCode::ControlLeft) || pressed(KeyCode::ControlRight) {
-        direction -= Vec3::Y;
-    }
+    let direction = *transform.forward() * intent.forward
+        + *transform.right() * intent.strafe
+        + Vec3::Y * intent.up;
     let mut speed = fly.speed;
-    if pressed(KeyCode::ShiftLeft) || pressed(KeyCode::ShiftRight) {
+    if intent.run {
         speed *= SHIFT_FACTOR;
     }
     transform.translation += direction.normalize_or_zero() * speed * time.delta_secs();

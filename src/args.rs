@@ -38,6 +38,17 @@ usage: doom_voxels --wad PATH [options]
   --stepped               show each voxel's light as a flat step instead of smoothing it
   --flash-time S          how long a shot's flash glows, in seconds (default 0.12)
   --closed-doors          keep door sectors closed
+  --fly                   start in the noclip fly camera instead of walking (V switches)
+  --god                   take no damage
+  --freeze                things stand still and don't think, for screenshots
+  --frame-times           print frame time statistics every 5 seconds
+  --mute                  no sound
+  --list-things           print where each monster stands, in voxels
+  --awake                 monsters start awake, chasing the player
+  --script STEPS          play a script once the world has settled: comma-separated steps
+                          w:S s:S a:S d:S (walk S seconds; capitals run), jw:S (jump while
+                          walking), jump, turn:DEG, pitch:DEG, fire:N, wait:S, shot:PATH,
+                          respawn
   --pos X,Y,Z             start the camera here, in voxel coordinates
   --yaw DEG               start yaw, 0 facing DOOM's north, positive turning left
   --pitch DEG             start pitch, positive looking up
@@ -68,6 +79,14 @@ pub struct Args {
     pub screenshot: Option<PathBuf>,
     pub quit_after: Option<f32>,
     pub no_vsync: bool,
+    pub fly: bool,
+    pub god: bool,
+    pub awake: bool,
+    pub list_things: bool,
+    pub freeze: bool,
+    pub frame_times: bool,
+    pub mute: bool,
+    pub script: Option<Vec<crate::input::Step>>,
 }
 
 /// How the map is lit.
@@ -234,6 +253,14 @@ fn parse_from(
         screenshot: None,
         quit_after: None,
         no_vsync: false,
+        fly: false,
+        god: false,
+        awake: false,
+        list_things: false,
+        freeze: false,
+        frame_times: false,
+        mute: false,
+        script: None,
     };
     let mut words = words.into_iter();
     while let Some(word) = words.next() {
@@ -243,6 +270,13 @@ fn parse_from(
             "--stepped" => args.knobs.stepped = true,
             "--no-vsync" => args.no_vsync = true,
             "--closed-doors" => args.closed_doors = true,
+            "--fly" => args.fly = true,
+            "--god" => args.god = true,
+            "--awake" => args.awake = true,
+            "--list-things" => args.list_things = true,
+            "--freeze" => args.freeze = true,
+            "--frame-times" => args.frame_times = true,
+            "--mute" => args.mute = true,
             _ => {
                 let value = words
                     .next()
@@ -352,6 +386,7 @@ fn parse_from(
                             .filter(|s| *s >= 0.0)
                             .ok_or_else(|| format!("{word} needs seconds, at least 0"))?
                     }
+                    "--script" => args.script = Some(crate::input::parse_script(&value)?),
                     "--pos" => args.pos = Some(parse_vec3(&value)?),
                     "--yaw" => args.yaw = Some(number("degrees")?),
                     "--pitch" => args.pitch = Some(number("degrees")?),
@@ -520,5 +555,24 @@ mod tests {
         assert!(parse(&["--blast-radius", "0"], Some("a.wad")).is_err());
         assert!(parse(&["--fire", "-1"], Some("a.wad")).is_err());
         assert!(parse(&["--bogus"], Some("a.wad")).is_err());
+    }
+
+    #[test]
+    fn game_flags() {
+        let args = parse(&[], Some("a.wad")).unwrap();
+        assert!(!args.fly && !args.god && !args.awake && args.script.is_none());
+        let args = parse(
+            &["--fly", "--god", "--awake", "--script", "w:1,jump"],
+            Some("a.wad"),
+        )
+        .unwrap();
+        assert!(args.fly && args.god && args.awake);
+        assert!(parse(
+            &["--mute", "--freeze", "--frame-times", "--list-things"],
+            Some("a.wad")
+        )
+        .is_ok_and(|a| a.mute && a.freeze && a.frame_times && a.list_things));
+        assert_eq!(args.script.map(|s| s.len()), Some(2));
+        assert!(parse(&["--script", "hop"], Some("a.wad")).is_err());
     }
 }

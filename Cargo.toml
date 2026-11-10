@@ -13,7 +13,7 @@ members = ["crates/wad", "crates/voxelize"]
 [dependencies]
 doom_wad = { path = "crates/wad" }
 doom_voxelize = { path = "crates/voxelize" }
-bevy = { version = "0.20", default-features = false, features = ["3d", "ui"] }
+bevy = { version = "0.20", default-features = false, features = ["3d", "ui", "bevy_audio", "wav"] }
 # While the experiment lives inside the crate's repo it builds against this
 # checkout. Once broken out, point this at a git rev of the crate instead.
 bevy_voxel_world = { path = "../..", features = ["light_propagation"] }
