@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use doom_voxelize::{Options, Voxel, VoxelMap};
+use doom_voxelize::{Options, Voxel, VoxelMap, INTERIOR_DEPTH};
 use doom_wad::{MapData, Wad};
 
 fn wad() -> Option<Wad> {
@@ -216,6 +216,96 @@ fn uniform_in_matches_brute_force_on_chunks() {
         started.elapsed().as_secs_f32()
     );
     assert!(claims > 100);
+}
+
+/// Boxes placed just past the interior depth below floors, above ceilings
+/// and behind walls, where `uniform_in` is closest to being wrong: every
+/// voxel of each box it calls uniform must agree.
+#[test]
+fn uniform_interior_agrees_at_the_interior_depth() {
+    let Some(wad) = wad() else { return };
+    let name = first_map(&wad);
+    let m = VoxelMap::build(&wad, &name, &Options::default()).unwrap();
+    let (min, max) = m.bounds();
+    let mut rng = 0x2545f4914f6cdd1du64;
+    let mut next = |lo: i32, hi: i32| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        lo + (rng % (hi - lo) as u64) as i32
+    };
+    let n = INTERIOR_DEPTH;
+    let (mut tried, mut claims, mut voxels) = (0, 0, 0u64);
+    while tried < 40_000 {
+        let (x, z) = (next(min[0], max[0]), next(min[2], max[2]));
+        let size = [next(1, 40), next(1, 40), next(1, 40)];
+        // The box's near face this far past the interior depth.
+        let past = next(-3, 8);
+        let lo_y = match (m.column_air(x, z), next(0, 3)) {
+            (Some((floor, _)), 0) => floor - 1 - n - past - size[1],
+            (Some((_, ceiling)), 1) if ceiling < max[1] => ceiling + n + past,
+            (None, _) => next(min[1], max[1]),
+            _ => continue,
+        };
+        tried += 1;
+        let lo = [x - size[0] / 2, lo_y, z - size[2] / 2];
+        let hi = [lo[0] + size[0], lo[1] + size[1], lo[2] + size[2]];
+        let Some(v) = m.uniform_in(lo, hi) else {
+            continue;
+        };
+        claims += 1;
+        for x in lo[0]..hi[0] {
+            for y in lo[1]..hi[1] {
+                for z in lo[2]..hi[2] {
+                    voxels += 1;
+                    assert_eq!(m.voxel([x, y, z]), v, "{lo:?}..{hi:?} at {x},{y},{z}");
+                }
+            }
+        }
+    }
+    println!("{name}: {claims} of {tried} boxes uniform, {voxels} voxels checked");
+    assert!(claims > 1000, "{claims} claims");
+}
+
+/// What one `voxel` call costs over the chunks the app would generate:
+/// every 32³ chunk inside the bounds that `uniform_in` can't answer. Only
+/// meaningful in a release build (`cargo test --release`).
+#[test]
+fn voxel_lookup_cost() {
+    let Some(wad) = wad() else { return };
+    let name = first_map(&wad);
+    let m = VoxelMap::build(&wad, &name, &Options::default()).unwrap();
+    let (min, max) = m.bounds();
+    let mut boxes = Vec::new();
+    for cz in min[2].div_euclid(32)..=max[2].div_euclid(32) {
+        for cy in min[1].div_euclid(32)..=max[1].div_euclid(32) {
+            for cx in min[0].div_euclid(32)..=max[0].div_euclid(32) {
+                let lo = [cx * 32 - 1, cy * 32 - 1, cz * 32 - 1];
+                let hi = lo.map(|v| v + 34);
+                if m.uniform_in(lo, hi).is_none() {
+                    boxes.push(lo);
+                }
+            }
+        }
+    }
+    let started = Instant::now();
+    let (mut n, mut solid) = (0u64, 0u64);
+    for lo in &boxes {
+        for x in lo[0]..lo[0] + 34 {
+            for y in lo[1]..lo[1] + 34 {
+                for z in lo[2]..lo[2] + 34 {
+                    n += 1;
+                    solid += matches!(m.voxel([x, y, z]), Voxel::Solid(_)) as u64;
+                }
+            }
+        }
+    }
+    let t = started.elapsed().as_secs_f64();
+    println!(
+        "{name}: {} mixed chunks, {n} voxels ({solid} solid) in {t:.3} s: {:.2} ns per voxel",
+        boxes.len(),
+        t * 1e9 / n as f64
+    );
 }
 
 #[test]

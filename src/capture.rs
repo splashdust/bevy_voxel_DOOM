@@ -2,10 +2,12 @@
 //! generating and meshing, saves the window as a PNG and exits. Also
 //! `--quit-after S`.
 //!
-//! The world counts as finished once every spawned chunk has been `Ready` for
+//! The world counts as settled once every spawned chunk has been `Ready` for
 //! `QUIET_FRAMES` frames in a row with no chunk spawned or despawned. Spawning
 //! rays only find chunks behind ones already generated, so a pause in new
 //! chunks is the sign that streaming has reached everything in view.
+//! [`WorldSettled`] carries that signal; anything that changes the world on
+//! the way to a screenshot, like a scripted shot, starts the count again.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,14 +29,42 @@ const GIVE_UP: Duration = Duration::from_secs(120);
 pub struct CapturePlugin {
     pub screenshot: Option<PathBuf>,
     pub quit_after: Option<f32>,
+    /// Track [`WorldSettled`] even without a screenshot.
+    pub track_settling: bool,
+}
+
+/// Whether the world around the camera has settled: every spawned chunk
+/// ready, and none spawned or despawned, for `QUIET_FRAMES` frames.
+#[derive(Resource, Default)]
+pub struct WorldSettled {
+    quiet: u32,
+    count: usize,
+    busy: usize,
+}
+
+impl WorldSettled {
+    pub fn is_settled(&self) -> bool {
+        self.quiet >= QUIET_FRAMES
+    }
+
+    /// Starts the count again, after changing the world.
+    pub fn unsettle(&mut self) {
+        self.quiet = 0;
+    }
+}
+
+/// `Track` updates [`WorldSettled`]; `Shoot` takes the screenshot. Systems
+/// that change the world once it has settled go between them.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CaptureSet {
+    Track,
+    Shoot,
 }
 
 #[derive(Resource)]
 struct ShotPlan {
     path: PathBuf,
     started: Instant,
-    quiet: u32,
-    last_count: usize,
     requested: bool,
 }
 
@@ -44,16 +74,19 @@ struct ShotSaved(bool);
 
 impl Plugin for CapturePlugin {
     fn build(&self, app: &mut App) {
+        if self.screenshot.is_some() || self.track_settling {
+            app.init_resource::<WorldSettled>()
+                .configure_sets(Update, CaptureSet::Track.before(CaptureSet::Shoot))
+                .add_systems(Update, track_settling.in_set(CaptureSet::Track));
+        }
         if let Some(path) = &self.screenshot {
             app.insert_resource(ShotPlan {
                 path: path.clone(),
                 started: Instant::now(),
-                quiet: 0,
-                last_count: 0,
                 requested: false,
             })
             .init_resource::<ShotSaved>()
-            .add_systems(Update, take_screenshot);
+            .add_systems(Update, take_screenshot.in_set(CaptureSet::Shoot));
         }
         if let Some(seconds) = self.quit_after {
             app.add_systems(
@@ -68,12 +101,30 @@ impl Plugin for CapturePlugin {
     }
 }
 
+fn track_settling(
+    mut settled: ResMut<WorldSettled>,
+    voxel_world: VoxelWorld<DoomWorld>,
+    chunks: Query<&Chunk<DoomWorld>>,
+) {
+    let count = chunks.iter().count();
+    let busy = chunks
+        .iter()
+        .filter(|chunk| voxel_world.chunk_state(chunk.key()) != Some(ChunkStatus::Ready))
+        .count();
+    if busy == 0 && count > 0 && count == settled.count {
+        settled.quiet += 1;
+    } else {
+        settled.quiet = 0;
+    }
+    settled.count = count;
+    settled.busy = busy;
+}
+
 fn take_screenshot(
     mut commands: Commands,
     mut plan: ResMut<ShotPlan>,
     saved: Res<ShotSaved>,
-    voxel_world: VoxelWorld<DoomWorld>,
-    chunks: Query<&Chunk<DoomWorld>>,
+    settled: Res<WorldSettled>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if saved.0 {
@@ -83,23 +134,12 @@ fn take_screenshot(
     if plan.requested {
         return;
     }
-    let count = chunks.iter().count();
-    let busy = chunks
-        .iter()
-        .filter(|chunk| voxel_world.chunk_state(chunk.key()) != Some(ChunkStatus::Ready))
-        .count();
-    if busy == 0 && count > 0 && count == plan.last_count {
-        plan.quiet += 1;
-    } else {
-        plan.quiet = 0;
-    }
-    plan.last_count = count;
-
     let elapsed = plan.started.elapsed();
     let timed_out = elapsed > GIVE_UP;
-    if plan.quiet < QUIET_FRAMES && !timed_out {
+    if !settled.is_settled() && !timed_out {
         return;
     }
+    let (busy, count) = (settled.busy, settled.count);
     if timed_out {
         warn!("the world didn't settle in {GIVE_UP:?}: {busy} of {count} chunks busy");
     }

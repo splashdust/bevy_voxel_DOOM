@@ -18,19 +18,23 @@ impl VoxelMap {
         )
     }
 
-    /// A flat's texel above or below voxel column `(x, z)`. Flats tile on
-    /// the world grid: r_plane.c `R_MapPlane` passes `x` and `−y` to
-    /// r_draw.c `R_DrawSpan`, which reads texel `(x & 63, −y & 63)`.
+    /// A flat's lit colour above or below voxel column `(x, z)`.
     pub(crate) fn flat(&self, flat: u16, table: u8, x: i32, z: i32) -> u8 {
+        self.tables[table as usize][self.flat_texel(flat, x, z) as usize]
+    }
+
+    /// A flat's texel above or below voxel column `(x, z)`, unlit. Flats
+    /// tile on the world grid: r_plane.c `R_MapPlane` passes `x` and `−y` to
+    /// r_draw.c `R_DrawSpan`, which reads texel `(x & 63, −y & 63)`.
+    pub(crate) fn flat_texel(&self, flat: u16, x: i32, z: i32) -> u8 {
         if flat == NO_TEX {
-            return self.tables[table as usize][FALLBACK as usize];
+            return FALLBACK;
         }
         // floor((2x + 1)·s / 2), the centre in whole map units.
         let s = self.s as i64;
         let u = ((2 * x as i64 + 1) * s).div_euclid(2) & 63;
         let v = ((2 * z as i64 + 1) * s).div_euclid(2) & 63;
-        let texel = self.flats[flat as usize][(v * 64 + u) as usize];
-        self.tables[table as usize][texel as usize]
+        self.flats[flat as usize][(v * 64 + u) as usize]
     }
 
     /// A wall voxel: solid voxel `[x, y, z]` in column `col` beside air of
@@ -42,9 +46,29 @@ impl VoxelMap {
         [x, y, z]: [i32; 3],
         (dx, dz): (i32, i32),
     ) -> u8 {
-        let air_sec = &self.sectors[air as usize];
-        let fallback = self.flat(air_sec.floor_flat, air_sec.flat_table, x + dx, z + dz);
         let line = self.lines[col] & !crate::MASKED;
+        let (ax, ay, _) = self.centre(x + dx, y, z + dz);
+        let (texel, table) = self.wall_texel_at(line, air, [x, y, z], (ax, ay), (dx, dz));
+        self.tables[table as usize][texel as usize]
+    }
+
+    /// The unlit texel and light table of the wall of linedef `line` at
+    /// voxel `[x, y, z]`, as seen from air of sector `air`, which lies on the
+    /// side of map point `air_point`. Without a texture there it is the air
+    /// sector's floor flat at column `(x + dx, z + dz)`.
+    pub(crate) fn wall_texel_at(
+        &self,
+        line: u16,
+        air: u16,
+        [x, y, z]: [i32; 3],
+        air_point: (f64, f64),
+        (dx, dz): (i32, i32),
+    ) -> (u8, u8) {
+        let air_sec = &self.sectors[air as usize];
+        let fallback = (
+            self.flat_texel(air_sec.floor_flat, x + dx, z + dz),
+            air_sec.flat_table,
+        );
         if line == NO_LINE {
             return fallback;
         }
@@ -57,9 +81,7 @@ impl VoxelMap {
                 } else if b.sector == air {
                     1
                 } else {
-                    // The side the air voxel's centre is on.
-                    let (ax, ay, _) = self.centre(x + dx, y, z + dz);
-                    (li.cross(ax, ay) > 0.0) as usize
+                    (li.cross(air_point.0, air_point.1) > 0.0) as usize
                 }
             }
             (Some(_), None) => 0,
@@ -116,7 +138,7 @@ impl VoxelMap {
             }
         };
         match self.wall_texel(li, side, facing, tex, top, px, py, h) {
-            Some(t) => self.tables[side.table as usize][t as usize],
+            Some(t) => (t, side.table),
             None => fallback,
         }
     }

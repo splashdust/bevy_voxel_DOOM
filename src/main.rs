@@ -6,6 +6,7 @@ mod args;
 mod camera;
 mod capture;
 mod hud;
+mod weapon;
 mod world;
 
 use std::sync::Arc;
@@ -95,12 +96,19 @@ fn main() -> AppExit {
     }))
     .add_plugins(FrameTimeDiagnosticsPlugin::default())
     .add_plugins(DoomWorldPlugin {
-        map,
+        map: Arc::clone(&map),
         units_per_voxel: args.units_per_voxel,
     })
     .add_plugins(capture::CapturePlugin {
         screenshot: args.screenshot.clone(),
         quit_after: args.quit_after,
+        track_settling: args.fire > 0,
+    })
+    .add_plugins(weapon::WeaponPlugin {
+        map,
+        radius: args.blast_radius,
+        range: world::view_distance_voxels(args.units_per_voxel),
+        scripted_shots: args.fire,
     })
     .insert_resource(ClearColor(Color::srgb_u8(r, g, b)))
     .insert_resource(start)
@@ -108,7 +116,10 @@ fn main() -> AppExit {
         name: map_name,
         units_per_voxel: args.units_per_voxel,
     })
-    .add_systems(Startup, (camera::spawn_camera, hud::spawn_hud))
+    .add_systems(
+        Startup,
+        (camera::spawn_camera, hud::spawn_hud, hud::spawn_crosshair),
+    )
     .add_systems(
         Update,
         (camera::grab_cursor, camera::fly, hud::update_hud).chain(),

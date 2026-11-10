@@ -18,6 +18,8 @@ usage: doom_voxels --wad PATH [options]
   --pos X,Y,Z             start the camera here, in voxel coordinates
   --yaw DEG               start yaw, 0 facing DOOM's north, positive turning left
   --pitch DEG             start pitch, positive looking up
+  --blast-radius R        the weapon's carved ball radius in voxels (default 4)
+  --fire N                fire N shots around the view centre once the world is ready
   --screenshot PATH       wait for the world around the camera to finish, save a PNG, exit
   --quit-after S          exit after S seconds
   --help                  this text";
@@ -35,6 +37,8 @@ pub struct Args {
     pub yaw: Option<f32>,
     /// Degrees.
     pub pitch: Option<f32>,
+    pub blast_radius: i32,
+    pub fire: u32,
     pub screenshot: Option<PathBuf>,
     pub quit_after: Option<f32>,
 }
@@ -70,6 +74,8 @@ fn parse_from(
         pos: None,
         yaw: None,
         pitch: None,
+        blast_radius: 4,
+        fire: 0,
         screenshot: None,
         quit_after: None,
     };
@@ -99,6 +105,17 @@ fn parse_from(
                             value.parse().ok().filter(|n: &i32| *n >= 1).ok_or_else(
                                 || format!("{word} needs a whole number from 1"),
                             )?
+                    }
+                    "--blast-radius" => {
+                        args.blast_radius =
+                            value.parse().ok().filter(|n: &i32| *n >= 1).ok_or_else(
+                                || format!("{word} needs a whole number from 1"),
+                            )?
+                    }
+                    "--fire" => {
+                        args.fire = value
+                            .parse()
+                            .map_err(|_| format!("{word} needs a whole number"))?
                     }
                     "--pos" => args.pos = Some(parse_vec3(&value)?),
                     "--yaw" => args.yaw = Some(number("degrees")?),
@@ -135,6 +152,14 @@ fn parse_vec3(text: &str) -> Result<Vec3, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn weapon_flags() {
+        let args = parse(&[], Some("a.wad")).unwrap();
+        assert_eq!((args.blast_radius, args.fire), (4, 0));
+        let args = parse(&["--blast-radius", "6", "--fire", "8"], Some("a.wad")).unwrap();
+        assert_eq!((args.blast_radius, args.fire), (6, 8));
+    }
+
     fn parse(words: &[&str], env: Option<&str>) -> Result<Args, String> {
         parse_from(words.iter().map(|w| w.to_string()), env.map(Into::into))
     }
@@ -168,6 +193,8 @@ mod tests {
         assert_eq!(args.map.as_deref(), Some("E1M2"));
         assert!(parse(&["--pos", "1,2"], Some("a.wad")).is_err());
         assert!(parse(&["--units-per-voxel", "0"], Some("a.wad")).is_err());
+        assert!(parse(&["--blast-radius", "0"], Some("a.wad")).is_err());
+        assert!(parse(&["--fire", "-1"], Some("a.wad")).is_err());
         assert!(parse(&["--bogus"], Some("a.wad")).is_err());
     }
 }

@@ -7,6 +7,7 @@ use doom_wad::{
     Colormap, LineDef, MapData, Palette, Picture, TextureSet, WadError, ML_TWOSIDED,
 };
 
+use crate::interior::INTERIOR_DEPTH;
 use crate::locate::Locator;
 use crate::tiles::{Stats, Tiles};
 use crate::{
@@ -18,8 +19,9 @@ use crate::{
 const VIEW_HEIGHT: i32 = 41;
 /// Headroom above the highest ceiling, in map units.
 const TOP_MARGIN: i32 = 32;
-/// Void columns around the map's bounding box.
-const PAD: i32 = 2;
+/// Void columns around the map's bounding box: room for wall colours to
+/// reach [`INTERIOR_DEPTH`] into the void behind the outermost walls.
+const PAD: i32 = INTERIOR_DEPTH + 2;
 
 /// Linedefs whose back sector is a door opened by using the line: p_switch.c
 /// `P_UseSpecialLine` → p_doors.c `EV_VerticalDoor`.
@@ -110,8 +112,9 @@ impl VoxelMap {
             sec.ceiling_v = sec.ceiling_v.max(sec.floor_v);
         }
 
-        // Bounds: the vertexes' box plus a void margin; vertically one floor
-        // voxel and one interior voxel under the lowest floor.
+        // Bounds: the vertexes' box plus a void margin; vertically the floor
+        // voxel and the interior colours under the lowest floor, then one
+        // more.
         let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
         for v in &map.vertexes {
             (x0, x1) = (x0.min(v.x as i32), x1.max(v.x as i32));
@@ -121,7 +124,8 @@ impl VoxelMap {
         let gx1 = x1.div_euclid(s) + PAD + 1;
         let gz0 = (-y1).div_euclid(s) - PAD;
         let gz1 = (-y0).div_euclid(s) + PAD + 1;
-        let bottom = sectors.iter().map(|c| c.floor_v).min().unwrap() - 2;
+        let bottom =
+            sectors.iter().map(|c| c.floor_v).min().unwrap() - 2 - INTERIOR_DEPTH;
         let top =
             sectors.iter().map(|c| c.ceiling_v).max().unwrap() + (TOP_MARGIN + s - 1) / s;
         let (width, depth) = (gx1 - gx0, gz1 - gz0);
@@ -192,6 +196,7 @@ impl VoxelMap {
             depth,
             columns,
             lines: Vec::new(),
+            near: Vec::new(),
             sectors,
             line_info,
             flats: flat_ids.take(&textures.flats, |p| {
@@ -212,6 +217,7 @@ impl VoxelMap {
             sky: [90, 110, 140],
         };
         vm.lines = vm.line_grid(map);
+        vm.near = vm.near_grid();
         vm.tiles = vm.tile_stats();
         vm.spawn = vm.find_spawn(map, &locator);
         if let Some(sky) = textures.walls.get(sky_texture_name(&map.name)) {
@@ -597,7 +603,11 @@ impl Buckets {
 }
 
 /// Runs `f(row index, row)` over the rows of a row-major grid on all cores.
-fn par_rows<T: Send>(grid: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+pub(crate) fn par_rows<T: Send>(
+    grid: &mut [T],
+    width: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
     if width == 0 {
         return;
     }

@@ -7,9 +7,9 @@
 /// What a group of columns allows a box to claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stats {
-    /// The lowest voxel that may differ from the interior colour, over the
-    /// columns and their 4-neighbours: a floor surface, or a wall facing a
-    /// neighbour's air. Below it every voxel is interior.
+    /// The lowest surface voxel over the columns and their 4-neighbours: a
+    /// floor surface, or a wall facing a neighbour's air. Below it every
+    /// voxel is solid and touches no air.
     pub lo: i32,
     /// One above the highest such voxel: a ceiling surface or a wall.
     pub hi: i32,

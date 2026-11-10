@@ -1,4 +1,5 @@
-//! A small text overlay: map, scale, camera voxel position and frame rate.
+//! A small text overlay: map, scale, camera voxel position and frame rate;
+//! and a crosshair at the screen centre.
 
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
@@ -34,6 +35,34 @@ pub fn spawn_hud(mut commands: Commands) {
         },
         HudText,
     ));
+}
+
+/// Crosshair arm length and thickness, in logical pixels.
+const CROSSHAIR_SIZE: f32 = 14.0;
+const CROSSHAIR_WIDTH: f32 = 2.0;
+
+pub fn spawn_crosshair(mut commands: Commands) {
+    for (w, h) in [
+        (CROSSHAIR_SIZE, CROSSHAIR_WIDTH),
+        (CROSSHAIR_WIDTH, CROSSHAIR_SIZE),
+    ] {
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(50.0),
+                top: Val::Percent(50.0),
+                width: Val::Px(w),
+                height: Val::Px(h),
+                margin: UiRect {
+                    left: Val::Px(-w / 2.0),
+                    top: Val::Px(-h / 2.0),
+                    ..default()
+                },
+                ..default()
+            },
+            BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
+        ));
+    }
 }
 
 pub fn update_hud(

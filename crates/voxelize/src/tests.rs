@@ -8,7 +8,7 @@ use doom_wad::{
     TextureSet, Thing, Vertex, ML_TWOSIDED, NF_SUBSECTOR,
 };
 
-use crate::{Options, Voxel, VoxelMap, INTERIOR};
+use crate::{Options, Voxel, VoxelMap, INTERIOR, INTERIOR_DEPTH};
 
 const H: i16 = 128;
 
@@ -307,18 +307,18 @@ fn spans_floors_ceilings_sky_and_bounds() {
     assert_eq!(m.voxel([x, 0, z]), Voxel::Air);
     assert_eq!(m.voxel([x, 63, z]), Voxel::Air);
     assert_eq!(m.voxel([x, 64, z]), Voxel::Solid(200));
-    assert_eq!(m.voxel([x, 65, z]), Voxel::Solid(INTERIOR));
     // The sky room is air to the top: ceiling 144 → voxel 72, plus 16.
     let (sx, sz) = col(301, 61);
     let (min, max) = m.bounds();
     assert_eq!(max[1], 72 + 16);
-    assert_eq!(min[1], -2);
+    assert_eq!(min[1], -2 - INTERIOR_DEPTH);
     assert_eq!(m.voxel([sx, 80, sz]), Voxel::Air);
     assert_eq!(m.voxel([sx, max[1] + 3, sz]), Voxel::Air);
     // Floor texel (301 & 63, −61 & 63) = (45, 3).
     assert_eq!(m.voxel([sx, 7, sz]), Voxel::Solid(45 + 64));
-    // The void is solid up to the top.
-    let (vx, vz) = col(64, 140);
+    // The void is solid up to the top; past the interior depth from any
+    // air it is interior.
+    let (vx, vz) = col(64, 150);
     assert_eq!(m.voxel([vx, 20, vz]), Voxel::Solid(INTERIOR));
     assert_eq!(m.voxel([vx, max[1] - 1, vz]), Voxel::Solid(INTERIOR));
     assert_eq!(m.voxel([vx, max[1], vz]), Voxel::Air);
@@ -427,7 +427,7 @@ fn spawn_is_at_view_height_facing_north() {
 fn uniform_in_never_claims_wrongly() {
     for m in [build(true, false), build(false, true)] {
         let (min, max) = m.bounds();
-        let mut claims = 0;
+        let (mut claims, mut interior) = (0, 0);
         let mut rng = 12345u64;
         let mut next = |n: i32| {
             rng = rng
@@ -435,7 +435,7 @@ fn uniform_in_never_claims_wrongly() {
                 .wrapping_add(1442695040888963407);
             ((rng >> 33) % n as u64) as i32
         };
-        for _ in 0..3000 {
+        for _ in 0..6000 {
             let size = [1 + next(40), 1 + next(40), 1 + next(40)];
             let lo = [
                 min[0] - 10 + next(max[0] - min[0] + 20),
@@ -445,6 +445,7 @@ fn uniform_in_never_claims_wrongly() {
             let hi = [lo[0] + size[0], lo[1] + size[1], lo[2] + size[2]];
             if let Some(v) = m.uniform_in(lo, hi) {
                 claims += 1;
+                interior += (v == Voxel::Solid(INTERIOR)) as i32;
                 for x in lo[0]..hi[0] {
                     for y in lo[1]..hi[1] {
                         for z in lo[2]..hi[2] {
@@ -458,6 +459,77 @@ fn uniform_in_never_claims_wrongly() {
                 }
             }
         }
+        println!("{claims} claims, {interior} of them interior");
         assert!(claims > 500, "{claims} claims");
+        assert!(interior > 100, "{interior} interior claims");
+    }
+}
+
+#[test]
+fn floors_and_ceilings_go_on_into_the_solid_darkening() {
+    let m = build(true, false);
+    // Room A's middle, far from other sectors. Floor texel 1 + 64; the test
+    // colormap adds the table number.
+    let (x, z) = col(65, 65);
+    assert_eq!(m.voxel([x, -1, z]), Voxel::Solid(1 + 64));
+    for depth in 1..INTERIOR_DEPTH {
+        let want = 1 + 64 + darker(depth);
+        assert_eq!(
+            m.voxel([x, -1 - depth, z]),
+            Voxel::Solid(want),
+            "depth {depth}"
+        );
+    }
+    assert_eq!(m.voxel([x, -1 - INTERIOR_DEPTH, z]), Voxel::Solid(INTERIOR));
+    // The ceiling flat (200) goes on up from voxel 64.
+    assert_eq!(m.voxel([x, 66, z]), Voxel::Solid(200 + darker(2)));
+    assert_eq!(m.voxel([x, 64 + 9, z]), Voxel::Solid(200 + darker(9)));
+    assert_eq!(m.voxel([x, 64 + INTERIOR_DEPTH, z]), Voxel::Solid(INTERIOR));
+}
+
+#[test]
+fn walls_extrude_into_the_void_and_into_steps() {
+    let m = build(true, false);
+    // Behind A's north wall (COLS, palette index = u = 21): the column three
+    // further north is depth 3.
+    let (x, z) = col(21, 129);
+    assert_eq!(m.voxel([x, 10, z]), Voxel::Solid(21));
+    assert_eq!(m.voxel([x, 10, z - 3]), Voxel::Solid(21 + darker(3)));
+    assert_eq!(m.voxel([x, 10, z - 9]), Voxel::Solid(21 + darker(9)));
+    assert_eq!(m.voxel([x, 10, z - 10]), Voxel::Solid(INTERIOR));
+    // Inside step B, one column in from the riser, under B's floor (voxel
+    // 8): the lower texture, row 16 − 9 = 7, at depth 1, nearer than the
+    // floor above (depth 3).
+    let (x, z) = col(131, 61);
+    assert_eq!(m.column_sector(x, z), Some(1));
+    assert_eq!(m.voxel([x, 4, z]), Voxel::Solid(7 + darker(1)));
+    // Right under B's floor the two are as near, and the floor flat wins.
+    assert_eq!(
+        m.voxel([x, 6, z]),
+        Voxel::Solid(m.shade_test_floor(x, z) + darker(1))
+    );
+}
+
+#[test]
+fn shade_darkens_through_colormap() {
+    let m = build(true, true);
+    assert_eq!(m.shade(40, 0), 40);
+    // The test colormap's table k adds k.
+    assert_eq!(m.shade(40, 3), 43);
+    assert_eq!(m.shade(40, 200), 40 + 31);
+}
+
+/// COLORMAP tables darker at `depth`: 31 at the interior depth, squared.
+fn darker(depth: i32) -> u8 {
+    let darker = (31 * depth * depth / (INTERIOR_DEPTH * INTERIOR_DEPTH)) as u8;
+    assert!(depth < 2 || darker > 0);
+    darker
+}
+
+impl VoxelMap {
+    /// The unlit floor texel of column `(x, z)`.
+    fn shade_test_floor(&self, x: i32, z: i32) -> u8 {
+        let s = self.column_sector(x, z).unwrap();
+        self.flat_texel(self.sectors[s as usize].floor_flat, x, z)
     }
 }

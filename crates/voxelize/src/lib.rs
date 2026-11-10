@@ -13,18 +13,23 @@
 //!
 //! Colours: the solid voxel under a sector's air is its floor flat, the one
 //! over it its ceiling flat; other solid voxels next to air are walls,
-//! textured from the linedef between them; the rest get [`INTERIOR`].
-//! See `build` for the import and `colour` for the texturing rules.
+//! textured from the linedef between them. Hidden solid voxels carry the
+//! nearest surface's flat or wall texture on into the solid, darker with
+//! depth, and are [`INTERIOR`] from [`INTERIOR_DEPTH`] voxels in. See
+//! `build` for the import, `colour` for the texturing rules and `interior`
+//! for the solid's inside.
 
 use doom_wad::{Palette, Picture, Wad, WadError};
 
 mod build;
 mod colour;
+mod interior;
 mod light;
 mod locate;
 mod tiles;
 
 pub use build::sky_texture_name;
+pub use interior::INTERIOR_DEPTH;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Voxel {
@@ -33,7 +38,7 @@ pub enum Voxel {
     Solid(u8),
 }
 
-/// The colour of solid voxels nothing can see: palette index 0, black.
+/// The colour of solid voxels deep inside the solid: palette index 0, black.
 pub const INTERIOR: u8 = 0;
 
 #[derive(Clone, Debug)]
@@ -123,6 +128,8 @@ pub struct VoxelMap {
     /// Per column: the linedef its walls are textured from, or [`NO_LINE`],
     /// with [`MASKED`] set where the column holds a masked slab.
     lines: Vec<u16>,
+    /// Per column: the nearest column of another sector with air.
+    near: Vec<interior::Near>,
     sectors: Vec<SectorInfo>,
     line_info: Vec<LineInfo>,
     flats: Vec<Box<[u8; 4096]>>,
@@ -173,18 +180,27 @@ impl VoxelMap {
                 return Voxel::Solid(self.flat(sec.ceiling_flat, sec.flat_table, x, z));
             }
         }
-        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            if let Some(air) = self.air_sector(x + dx, y, z + dz) {
-                return Voxel::Solid(self.wall(col, air, p, (dx, dz)));
+        // Air beside a solid voxel is another sector's, so only columns next
+        // to one can have a wall.
+        let near = self.near[col];
+        if near.dist == 1 {
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                if let Some(air) = self.air_sector(x + dx, y, z + dz) {
+                    return Voxel::Solid(self.wall(col, air, p, (dx, dz)));
+                }
             }
         }
-        Voxel::Solid(INTERIOR)
+        Voxel::Solid(self.interior(near, sector, p))
     }
 
     /// `Some(v)` when every voxel in the box `min..max` (max exclusive) is
     /// known to be `v` without visiting them; `None` when it may vary. Must
     /// be cheap: the app calls it once per chunk to skip generating uniform
     /// chunks.
+    ///
+    /// It says [`INTERIOR`] only when the box grown by `INTERIOR_DEPTH + 1`
+    /// on every side holds no surface, since colours reach that far into the
+    /// solid.
     pub fn uniform_in(&self, min: [i32; 3], max: [i32; 3]) -> Option<Voxel> {
         let (bottom, top) = (self.min[1], self.max[1]);
         if min[1] >= top {
@@ -193,15 +209,21 @@ impl VoxelMap {
         if max[1] <= bottom {
             return Some(Voxel::Solid(INTERIOR));
         }
-        let st = self.tiles.stats(
-            min[0] - self.min[0],
-            max[0] - self.min[0],
-            min[2] - self.min[2],
-            max[2] - self.min[2],
-        );
-        if max[1] <= top && (max[1] <= st.lo || min[1] >= st.hi) {
+        let stats = |grow: i32| {
+            self.tiles.stats(
+                min[0] - grow - self.min[0],
+                max[0] + grow - self.min[0],
+                min[2] - grow - self.min[2],
+                max[2] + grow - self.min[2],
+            )
+        };
+        let grow = INTERIOR_DEPTH + 1;
+        let around = stats(grow);
+        let (lo, hi) = (min[1] - grow, max[1] + grow);
+        if hi <= top && (hi <= around.lo || lo >= around.hi) {
             return Some(Voxel::Solid(INTERIOR));
         }
+        let st = stats(0);
         if !st.blocked && min[1] >= st.air_lo && max[1] <= st.air_hi {
             return Some(Voxel::Air);
         }
