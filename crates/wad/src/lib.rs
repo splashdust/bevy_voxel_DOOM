@@ -7,6 +7,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+mod bytes;
+mod directory;
+mod map;
+mod picture;
+mod texture;
+
+pub use picture::{decode_patch, Patch};
+pub use texture::SkippedTexture;
+
 #[derive(Debug)]
 pub enum WadError {
     Io(std::io::Error),
@@ -36,7 +45,8 @@ impl From<std::io::Error> for WadError {
 }
 
 pub struct Wad {
-    _data: Vec<u8>,
+    data: Vec<u8>,
+    entries: Vec<directory::Entry>,
 }
 
 impl Wad {
@@ -45,37 +55,98 @@ impl Wad {
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Wad, WadError> {
-        Ok(Wad { _data: data })
+        let entries = directory::parse(&data)?;
+        Ok(Wad { data, entries })
     }
 
     /// The last lump with this name, as later lumps override earlier ones.
-    pub fn lump(&self, _name: &str) -> Option<&[u8]> {
-        None
+    pub fn lump(&self, name: &str) -> Option<&[u8]> {
+        let name = name.to_ascii_uppercase();
+        let e = self.entries.iter().rev().find(|e| e.name == name)?;
+        Some(self.entry_data(e))
     }
 
     /// The names of the maps in the WAD, `E1M1` or `MAP01` style, in directory order.
     pub fn map_names(&self) -> Vec<String> {
-        Vec::new()
+        self.entries
+            .windows(2)
+            .filter(|w| map::is_map_name(&w[0].name) && w[1].name == "THINGS")
+            .map(|w| w[0].name.clone())
+            .collect()
     }
 
     pub fn map(&self, name: &str) -> Result<MapData, WadError> {
-        Err(WadError::MissingMap(name.to_string()))
+        map::decode(self, name)
     }
 
     /// Palette 0 of PLAYPAL.
     pub fn palette(&self) -> Result<Palette, WadError> {
-        Err(WadError::MissingLump("PLAYPAL".into()))
+        let lump = self
+            .lump("PLAYPAL")
+            .ok_or_else(|| WadError::MissingLump("PLAYPAL".into()))?;
+        let bytes = lump.get(..768).ok_or_else(|| {
+            WadError::Malformed(format!("PLAYPAL is {} bytes, under 768", lump.len()))
+        })?;
+        let mut palette = [[0; 3]; 256];
+        for (colour, rgb) in palette.iter_mut().zip(bytes.as_chunks::<3>().0) {
+            *colour = *rgb;
+        }
+        Ok(palette)
     }
 
     pub fn colormap(&self) -> Result<Colormap, WadError> {
-        Err(WadError::MissingLump("COLORMAP".into()))
+        const SIZE: usize = 34 * 256;
+        let lump = self
+            .lump("COLORMAP")
+            .ok_or_else(|| WadError::MissingLump("COLORMAP".into()))?;
+        let bytes = lump.get(..SIZE).ok_or_else(|| {
+            WadError::Malformed(format!("COLORMAP is {} bytes, under {SIZE}", lump.len()))
+        })?;
+        let tables = bytes.as_chunks::<256>().0.to_vec();
+        Ok(Colormap { tables })
     }
 
     /// Every flat between F_START and F_END, and every wall texture from
     /// TEXTURE1 and TEXTURE2, composited from its patches.
     pub fn textures(&self) -> Result<TextureSet, WadError> {
-        Err(WadError::MissingLump("TEXTURE1".into()))
+        Ok(self.textures_with_skipped()?.textures)
     }
+
+    /// `textures`, plus the wall textures left out because a patch is
+    /// missing or corrupt.
+    pub fn textures_with_skipped(&self) -> Result<LoadedTextures, WadError> {
+        let flats = texture::flats(self)?;
+        let (walls, skipped) = texture::walls(self)?;
+        Ok(LoadedTextures {
+            textures: TextureSet { flats, walls },
+            skipped,
+        })
+    }
+
+    /// The last lump with this name, decoded as a picture: a patch or a sprite.
+    pub fn patch(&self, name: &str) -> Result<Patch, WadError> {
+        let lump = self
+            .lump(name)
+            .ok_or_else(|| WadError::MissingLump(name.to_ascii_uppercase()))?;
+        decode_patch(lump).map_err(|e| match e {
+            WadError::Malformed(m) => WadError::Malformed(format!("{name}: {m}")),
+            e => e,
+        })
+    }
+
+    fn entry_data(&self, e: &directory::Entry) -> &[u8] {
+        if e.size == 0 {
+            &[]
+        } else {
+            &self.data[e.offset..e.offset + e.size]
+        }
+    }
+}
+
+/// What `Wad::textures_with_skipped` returns.
+pub struct LoadedTextures {
+    pub textures: TextureSet,
+    pub skipped: Vec<SkippedTexture>,
 }
 
 /// 256 RGB colours.
@@ -230,4 +301,106 @@ pub struct Blockmap {
     pub rows: u16,
     /// Linedef indices per cell, row-major from the origin: cell (c, r) is `cells[r * columns + c]`.
     pub cells: Vec<Vec<u16>>,
+}
+
+#[cfg(test)]
+mod test_support {
+    /// An 8-byte, NUL-padded name field.
+    pub(crate) fn name_field(name: &str) -> [u8; 8] {
+        let mut f = [0; 8];
+        for (d, s) in f.iter_mut().zip(name.bytes()) {
+            *d = s;
+        }
+        f
+    }
+
+    /// A PWAD holding these lumps in order, directory last.
+    pub(crate) fn build_wad(lumps: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut data = b"PWAD".to_vec();
+        data.extend_from_slice(&[0; 8]);
+        let mut dir = Vec::new();
+        for (name, lump) in lumps {
+            dir.extend_from_slice(&(data.len() as i32).to_le_bytes());
+            dir.extend_from_slice(&(lump.len() as i32).to_le_bytes());
+            dir.extend_from_slice(&name_field(name));
+            data.extend_from_slice(lump);
+        }
+        let table = data.len() as i32;
+        data[4..8].copy_from_slice(&(lumps.len() as i32).to_le_bytes());
+        data[8..12].copy_from_slice(&table.to_le_bytes());
+        data.extend(dir);
+        data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::build_wad;
+
+    #[test]
+    fn directory_names_are_upper_case_and_last_lump_wins() {
+        let wad = Wad::from_bytes(build_wad(&[
+            ("demo1", b"first"),
+            ("OTHER", b""),
+            ("DEMO1", b"second"),
+        ]))
+        .unwrap();
+        assert_eq!(wad.lump("DEMO1"), Some(&b"second"[..]));
+        assert_eq!(wad.lump("demo1"), Some(&b"second"[..]));
+        assert_eq!(wad.lump("OTHER"), Some(&b""[..]));
+        assert_eq!(wad.lump("NOPE"), None);
+    }
+
+    #[test]
+    fn iwad_header_is_accepted() {
+        let mut data = build_wad(&[("A", b"x")]);
+        data[..4].copy_from_slice(b"IWAD");
+        assert!(Wad::from_bytes(data).is_ok());
+    }
+
+    #[test]
+    fn corrupt_headers_and_directories_are_malformed() {
+        let good = build_wad(&[("A", b"abcd")]);
+        let malformed =
+            |d: Vec<u8>| matches!(Wad::from_bytes(d), Err(WadError::Malformed(_)));
+        assert!(malformed(good[..11].to_vec()));
+        let mut bad_ident = good.clone();
+        bad_ident[..4].copy_from_slice(b"ZWAD");
+        assert!(malformed(bad_ident));
+        // Directory cut short.
+        assert!(malformed(good[..good.len() - 1].to_vec()));
+        // Lump size past the end of the file.
+        let mut long_lump = good.clone();
+        let dir = good.len() - 16;
+        long_lump[dir + 4..dir + 8].copy_from_slice(&1000i32.to_le_bytes());
+        assert!(malformed(long_lump));
+        let mut negative = good.clone();
+        negative[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(malformed(negative));
+    }
+
+    #[test]
+    fn palette_and_colormap() {
+        let playpal: Vec<u8> = (0..768 * 14).map(|i| (i % 251) as u8).collect();
+        let colormap: Vec<u8> = (0..34 * 256).map(|i| (i / 256) as u8).collect();
+        let wad =
+            Wad::from_bytes(build_wad(&[("PLAYPAL", &playpal), ("COLORMAP", &colormap)]))
+                .unwrap();
+        let pal = wad.palette().unwrap();
+        assert_eq!(pal[1], [3, 4, 5]);
+        let cm = wad.colormap().unwrap();
+        assert_eq!(cm.tables.len(), 34);
+        assert_eq!(cm.tables[33][0], 33);
+
+        let short = Wad::from_bytes(build_wad(&[
+            ("PLAYPAL", &playpal[..767]),
+            ("COLORMAP", &colormap[..100]),
+        ]))
+        .unwrap();
+        assert!(matches!(short.palette(), Err(WadError::Malformed(_))));
+        assert!(matches!(short.colormap(), Err(WadError::Malformed(_))));
+        let empty = Wad::from_bytes(build_wad(&[])).unwrap();
+        assert!(matches!(empty.palette(), Err(WadError::MissingLump(_))));
+    }
 }
