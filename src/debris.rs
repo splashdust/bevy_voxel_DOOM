@@ -20,7 +20,8 @@
 //! It then stops moving and a copy of it slides and turns into that cell
 //! over `SNAP_TIME`, and stays until the chunk holding the cell has remeshed
 //! and the regions around it have been rebuilt, so neither the voxel nor the
-//! floor under the cubes resting on it blinks out.
+//! floor under the cubes resting on it blinks out. A cube that falls out of
+//! the world is dropped.
 
 use std::collections::HashMap;
 use std::f32::consts::TAU;
@@ -72,10 +73,14 @@ const REBUILD_DELAY: f32 = 0.1;
 const MAX_DELAYED_REBUILDS: usize = 8;
 /// Seconds a region stays after no cube has come near it.
 const FREE_AFTER: f32 = 2.0;
-/// A cube needs the regions it can reach in this many seconds at its speed,
-/// and within `REACH_MARGIN` voxels.
+/// A cube needs the regions it can reach before they are next built: in
+/// `LOOKAHEAD` seconds at its speed, or two of the last frame if longer,
+/// since a long frame runs several physics steps, and within `REACH_MARGIN`
+/// voxels.
 const LOOKAHEAD: f32 = 0.1;
 const REACH_MARGIN: f32 = 2.0;
+/// A cube this many voxels below the map's lowest voxel has left the world.
+const BELOW_WORLD: i32 = 16;
 
 /// Throws debris out of a carve: a sample of `carved`, one cube per voxel,
 /// each in the colour of its material.
@@ -136,9 +141,13 @@ impl Plugin for DebrisPlugin {
                     end_step.after(PhysicsSystems::Last),
                 ),
             )
+            // In `PostUpdate`, so every edit made in `Update` this frame, a
+            // carve included, is in the world the colliders are built from.
             .add_systems(
-                Update,
-                (spray, settle, snap, update_regions, report).chain(),
+                PostUpdate,
+                (spray, settle, snap, update_regions, report)
+                    .chain()
+                    .before(TransformSystems::Propagate),
             );
     }
 }
@@ -239,7 +248,8 @@ struct Stats {
     active_since: Option<Instant>,
     launched: u32,
     placed: u32,
-    /// Placed or dropped when its time or the cap ran out, not at rest.
+    /// Placed or dropped when its time or the cap ran out, or when it fell
+    /// out of the world, not at rest.
     forced: u32,
     dropped: u32,
     most_live: usize,
@@ -294,6 +304,7 @@ fn spray(
 ) {
     stats.update_started = Some(Instant::now());
     let now = time.elapsed_secs();
+    let lookahead = lookahead(time.delta_secs());
     for message in sprays.read() {
         let Some((min, max)) = bounds(message.carved.iter().map(|(p, _)| *p)) else {
             continue;
@@ -342,7 +353,7 @@ fn spray(
                 Mesh3d(debris.flying_mesh.clone()),
                 MeshMaterial3d(handle),
             ));
-            let reach = Vec3::splat(REACH_MARGIN) + velocity.abs() * LOOKAHEAD;
+            let reach = Vec3::splat(REACH_MARGIN) + velocity.abs() * lookahead;
             regions.need(
                 (centre - reach).floor().as_ivec3(),
                 (centre + reach).floor().as_ivec3(),
@@ -382,7 +393,14 @@ fn settle(
     let slow = SLOW_SPEED * debris.voxels_per_metre;
     let mut due = Vec::new();
     let mut flying = Vec::new();
+    let floor = (debris.map.bounds().0[1] - BELOW_WORLD) as f32;
     for (entity, mut cube, transform, velocity, spin, sleeping) in &mut cubes {
+        if transform.translation.y < floor {
+            commands.entity(entity).despawn();
+            stats.dropped += 1;
+            stats.forced += 1;
+            continue;
+        }
         cube.age += dt;
         if velocity.length() < slow && spin.length() < SLOW_SPIN {
             cube.slow_for += dt;
@@ -506,19 +524,30 @@ fn snap(
 }
 
 /// Keeps a collider region around each cube in flight, rebuilds regions the
-/// world changed in, and drops regions no cube needs.
+/// world changed in, whatever changed it, and drops regions no cube needs.
+#[allow(clippy::too_many_arguments)]
 fn update_regions(
     mut commands: Commands,
     cubes: Query<(&Transform, &LinearVelocity), With<Cube>>,
+    mut committed: MessageReader<EditsCommitted<DoomWorld>>,
     debris: Res<Debris>,
     mut regions: ResMut<Regions>,
     mut stats: ResMut<Stats>,
     voxel_world: VoxelWorld<DoomWorld>,
+    frame: Res<FrameCount>,
     time: Res<Time>,
 ) {
     let now = time.elapsed_secs();
+    let lookahead = lookahead(time.delta_secs());
+    // Edits commit in `PreUpdate` of the frame after they were made.
+    let set_frame = frame.0.wrapping_sub(1);
+    for message in committed.read() {
+        if let Some((min, max)) = bounds(message.delta.iter().map(|(p, _)| p)) {
+            regions.committed(min - IVec3::ONE, max + IVec3::ONE, now, set_frame);
+        }
+    }
     for (transform, velocity) in &cubes {
-        let reach = Vec3::splat(REACH_MARGIN) + velocity.abs() * LOOKAHEAD;
+        let reach = Vec3::splat(REACH_MARGIN) + velocity.abs() * lookahead;
         let p = transform.translation;
         regions.need(
             (p - reach).floor().as_ivec3(),
@@ -561,7 +590,7 @@ fn update_regions(
             }
             (None, None) => None,
         };
-        regions.built(key, entity);
+        regions.built(key, entity, frame.0);
         let secs = started.elapsed().as_secs_f64();
         stats.builds += 1;
         stats.build_secs += secs;
@@ -634,6 +663,11 @@ fn report(
         ms(stats.longest_update),
     );
     *stats = Stats::default();
+}
+
+/// Seconds of flight a cube needs colliders for, after a frame of `dt`.
+fn lookahead(dt: f32) -> f32 {
+    LOOKAHEAD.max(2.0 * dt)
 }
 
 /// The smallest box holding `points`, both corners inclusive.
@@ -765,11 +799,22 @@ struct Region {
     /// The last edit this region's collider holds, or `None` if it was
     /// never built.
     built: Option<u64>,
+    /// The frame it was last built in.
+    built_frame: u32,
     /// When a cube last needed this region, in seconds.
     needed_at: f32,
     /// When an edit since the build first changed it, and whether one
     /// was a carve, which can't wait.
     changed: Option<(f32, bool)>,
+}
+
+impl Region {
+    /// Marks the region changed at `now`, keeping when it first changed.
+    fn change(&mut self, now: f32, urgent: bool) {
+        let since = self.changed.map_or(now, |(since, _)| since);
+        let was_urgent = self.changed.is_some_and(|(_, u)| u);
+        self.changed = Some((since, urgent || was_urgent));
+    }
 }
 
 impl Regions {
@@ -793,6 +838,7 @@ impl Regions {
                 .or_insert(Region {
                     entity: None,
                     built: None,
+                    built_frame: 0,
                     needed_at: now,
                     changed: None,
                 })
@@ -809,12 +855,27 @@ impl Regions {
         self.edits += 1;
         for key in Self::keys(min, max) {
             if let Some(region) = self.regions.get_mut(&key) {
-                let since = region.changed.map_or(now, |(since, _)| since);
-                let was_urgent = region.changed.is_some_and(|(_, u)| u);
-                region.changed = Some((since, urgent || was_urgent));
+                region.change(now, urgent);
             }
         }
         self.edits
+    }
+
+    /// Records voxel edits that the voxel world committed, which changed the
+    /// voxels in the box and were made in frame `set_frame`. A region built in
+    /// that frame or later already holds them, since the debris systems run
+    /// in `PostUpdate`, after the edits of a frame. Edits come back this way
+    /// a frame after they were made, carves and settled cubes included, and
+    /// so do edits nothing told the debris about, like a shot's flash.
+    fn committed(&mut self, min: IVec3, max: IVec3, now: f32, set_frame: u32) {
+        self.edits += 1;
+        for key in Self::keys(min, max) {
+            if let Some(region) = self.regions.get_mut(&key) {
+                if region.built.is_some() && region.built_frame < set_frame {
+                    region.change(now, false);
+                }
+            }
+        }
     }
 
     /// The regions to build now: those never built, those a carve changed,
@@ -841,10 +902,11 @@ impl Regions {
     }
 
     /// Records that region `key` was built from the world as it is now.
-    fn built(&mut self, key: IVec3, entity: Option<Entity>) {
+    fn built(&mut self, key: IVec3, entity: Option<Entity>, frame: u32) {
         if let Some(region) = self.regions.get_mut(&key) {
             region.entity = entity;
             region.built = Some(self.edits);
+            region.built_frame = frame;
             region.changed = None;
         }
     }
@@ -1039,7 +1101,7 @@ mod tests {
         let p = IVec3::new(5, 5, 5);
         regions.need(p, p, 0.0);
         assert_eq!(regions.due(0.0, 8), vec![IVec3::ZERO]);
-        regions.built(IVec3::ZERO, None);
+        regions.built(IVec3::ZERO, None, 0);
         assert!(regions.due(0.0, 8).is_empty());
 
         // A settled cube waits for the delay, and is held only after the build.
@@ -1051,8 +1113,22 @@ mod tests {
         let later = 1.0 + REBUILD_DELAY + 0.01;
         assert_eq!(regions.due(later, 8), vec![IVec3::ZERO]);
         assert!(regions.due(later, 0).is_empty());
-        regions.built(IVec3::ZERO, None);
+        regions.built(IVec3::ZERO, None, 0);
         assert!(regions.holds(p, edit));
+
+        // A committed edit made in the frame of the build or before is
+        // already in it; one made later rebuilds it, after the delay.
+        regions.built(IVec3::ZERO, None, 10);
+        regions.committed(p, p, 1.5, 10);
+        assert!(regions.due(1.5 + REBUILD_DELAY + 0.01, 8).is_empty());
+        regions.committed(p, p, 1.5, 9);
+        assert!(regions.due(1.5 + REBUILD_DELAY + 0.01, 8).is_empty());
+        regions.committed(p, p, 1.5, 11);
+        assert_eq!(
+            regions.due(1.5 + REBUILD_DELAY + 0.01, 8),
+            vec![IVec3::ZERO]
+        );
+        regions.built(IVec3::ZERO, None, 11);
 
         // A carve rebuilds at once; a region that doesn't exist holds anything.
         regions.edited(p, p, 2.0, true);
