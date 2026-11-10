@@ -253,6 +253,8 @@ pub struct PaletteMaterial {
 /// level 15 shows as brightness `lamp_gain`, a face whose own voxel gives off
 /// light at `glow_from` or more glows as a lamp's, and with `in_srgb` at 1 the
 /// brightness scales the colour's sRGB value rather than its linear one.
+/// `gain` scales every colour's sRGB value last, for the map's contrast
+/// (`VoxelMap::colour_gain`).
 ///
 /// Sector glow scales in sRGB because COLORMAP does: a table leaves dark and
 /// bright colours at about the same share of their sRGB value, where the same
@@ -267,11 +269,13 @@ pub struct ShaderLight {
     pub lamp_gain: f32,
     pub glow_from: f32,
     pub in_srgb: f32,
+    pub gain: f32,
 }
 
 impl ShaderLight {
-    pub fn new(mode: LightMode, knobs: &LightKnobs) -> Self {
+    pub fn new(mode: LightMode, knobs: &LightKnobs, gain: f32) -> Self {
         ShaderLight {
+            gain,
             lamp_gain: knobs.lamp_gain(mode),
             glow_from: if mode.sector_glow() { 14.5 } else { 0.5 },
             in_srgb: if mode.sector_glow() { 1.0 } else { 0.0 },
@@ -352,7 +356,7 @@ impl Plugin for DoomWorldPlugin {
                 ))
                 .with_material(PaletteMaterial::new(
                     self.map.palette(),
-                    ShaderLight::new(self.light, &self.knobs),
+                    ShaderLight::new(self.light, &self.knobs, self.map.colour_gain()),
                 )),
             );
     }

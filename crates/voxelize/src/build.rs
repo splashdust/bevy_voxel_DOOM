@@ -91,7 +91,13 @@ impl VoxelMap {
         } else {
             map.sectors.iter().map(|s| s.ceiling as i32).collect()
         };
-        let table = |t: u8| if options.sector_light { t + 1 } else { 0 };
+        let table = |t: u8| {
+            if options.sector_light {
+                light::stretch(t, options.contrast) + 1
+            } else {
+                0
+            }
+        };
         let glow_levels = light::GlowLevels::measure(&palette, colormap);
         let glow = |t: u8| {
             if options.sector_glow {
@@ -236,6 +242,11 @@ impl VoxelMap {
             sky: [90, 110, 140],
             lamps: Lamps::default(),
             glow: glow_levels.clone(),
+            gain: if options.sector_light {
+                light::contrast_gain(options.contrast)
+            } else {
+                1.0
+            },
         };
         vm.lines = vm.line_grid(map);
         vm.near = vm.near_grid();

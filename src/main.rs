@@ -54,6 +54,7 @@ fn main() -> AppExit {
     let options = Options {
         units_per_voxel: args.units_per_voxel,
         sector_light: args.light.sector_light(),
+        contrast: args.contrast,
         open_doors: !args.closed_doors,
         lamps: args.light.propagated().then_some(args.knobs.lamp_level),
         sector_glow: args.light.sector_glow(),

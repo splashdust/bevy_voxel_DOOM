@@ -20,6 +20,8 @@ usage: doom_voxels --wad PATH [options]
                           sector-glow: full-bright colours, every surface glowing at its
                           sector's light, carried by propagated light;
                           flat: full-bright, no light at all
+  --contrast K            stretch baked sector light: 1 is DOOM's, above 1 brightens bright
+                          sectors and darkens dark ones (default 1.25)
   --min-light B           propagated light's least brightness, 0 to 1
                           (default 0.08, 0 in sector-glow)
   --falloff BASE          each light level is BASE times as bright as the one above (default 0.9);
@@ -60,6 +62,7 @@ pub struct Args {
     pub yaw: Option<f32>,
     /// Degrees.
     pub pitch: Option<f32>,
+    pub contrast: f32,
     pub blast_radius: i32,
     pub fire: u32,
     pub screenshot: Option<PathBuf>,
@@ -225,6 +228,7 @@ fn parse_from(
         pos: None,
         yaw: None,
         pitch: None,
+        contrast: 1.25,
         blast_radius: 4,
         fire: 0,
         screenshot: None,
@@ -258,6 +262,12 @@ fn parse_from(
                             value.parse().ok().filter(|n: &i32| *n >= 1).ok_or_else(
                                 || format!("{word} needs a whole number from 1"),
                             )?
+                    }
+                    "--contrast" => {
+                        args.contrast = number("a number above 0")?;
+                        if args.contrast <= 0.0 {
+                            return Err(format!("{word} needs a number above 0"));
+                        }
                     }
                     "--blast-radius" => {
                         args.blast_radius =

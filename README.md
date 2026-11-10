@@ -53,6 +53,7 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--list-maps` | print the WAD's maps and exit |
 | `--units-per-voxel N` | DOOM map units per voxel, 2 by default |
 | `--light MODE` | `sector` (default): DOOM's sector light baked in, no propagation. `propagated`: full-bright colours times propagated light. `both`: sector light baked in, times propagated light. `sector-glow`: full-bright colours, every surface glowing at its sector's light. `flat`: full-bright, no light at all |
+| `--contrast K` | stretches baked sector light away from a middle light (about light 128), 1.25 by default; 1 is DOOM's own. Dark sectors take darker COLORMAP tables; bright ones get brighter through a gain on every colour, since no table is brighter than the palette |
 | `--min-light B` | the least brightness propagated light leaves, from 0 to 1, 0.08 by default and 0 in `sector-glow` |
 | `--falloff BASE` | each light level is `BASE` times as bright as the one above, 0.9 by default; 1 is linear. In `sector-glow` lamp light follows COLORMAP instead |
 | `--sky on\|off` | sky light, on by default and off in `sector-glow` |

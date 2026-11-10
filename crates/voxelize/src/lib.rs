@@ -69,6 +69,12 @@ pub struct Options {
     /// Pass colours through COLORMAP at each sector's light level, so DOOM's
     /// sector lighting is baked in. Off gives full-bright colours.
     pub sector_light: bool,
+    /// How far baked sector light is stretched away from a middle light:
+    /// 1 is DOOM's own, above 1 makes bright sectors brighter and dark ones
+    /// darker. Darker comes from darker COLORMAP tables, brighter from
+    /// [`VoxelMap::colour_gain`], which the renderer applies. See
+    /// `light::stretch`.
+    pub contrast: f32,
     /// Bake door sectors open, as if every door had been used.
     pub open_doors: bool,
     /// Light sources: the bright texels of light flats and wall textures
@@ -87,6 +93,7 @@ impl Default for Options {
         Options {
             units_per_voxel: 2,
             sector_light: true,
+            contrast: 1.0,
             open_doors: true,
             lamps: None,
             sector_glow: false,
@@ -178,6 +185,8 @@ pub struct VoxelMap {
     tables: Vec<[u8; 256]>,
     tiles: tiles::Tiles,
     spawn: ([f32; 3], f32),
+    /// See [`VoxelMap::colour_gain`].
+    gain: f32,
     sky: [u8; 3],
     /// Light sources, empty without [`Options::lamps`].
     lamps: lamps::Lamps,
@@ -293,6 +302,13 @@ impl VoxelMap {
     /// height, 41 units), and the yaw in radians around +y, 0 facing −z.
     pub fn spawn(&self) -> ([f32; 3], f32) {
         self.spawn
+    }
+
+    /// The gain on every colour's sRGB value that [`Options::contrast`]
+    /// needs to brighten bright sectors past the palette, 1 without it. The
+    /// renderer applies it; palette indices can't carry it.
+    pub fn colour_gain(&self) -> f32 {
+        self.gain
     }
 
     /// An RGB colour for the sky, for the clear colour.

@@ -279,6 +279,7 @@ fn build(open_doors: bool, sector_light: bool) -> VoxelMap {
     let options = Options {
         units_per_voxel: 2,
         sector_light,
+        contrast: 1.0,
         open_doors,
         lamps: None,
         sector_glow: false,
@@ -314,6 +315,7 @@ fn build_lamps(lamps: Option<LampLevel>, sector_light: bool) -> VoxelMap {
     let options = Options {
         units_per_voxel: 2,
         sector_light,
+        contrast: 1.0,
         open_doors: true,
         lamps,
         sector_glow: false,
@@ -337,6 +339,7 @@ fn build_glow(lamps: Option<LampLevel>) -> VoxelMap {
     let options = Options {
         units_per_voxel: 2,
         sector_light: false,
+        contrast: 1.0,
         open_doors: true,
         lamps,
         sector_glow: true,

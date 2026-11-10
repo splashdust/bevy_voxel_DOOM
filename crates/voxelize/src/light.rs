@@ -47,6 +47,41 @@ pub(crate) fn flat_table(lightlevel: u16) -> u8 {
     (startmap(level(lightlevel)) - scale / 2).clamp(0, NUMCOLORMAPS - 1) as u8
 }
 
+/// The table contrast stretches away from: a wall at light 112, a flat at
+/// light 128. DOOM's lit rooms draw brighter than it, and its dark rooms
+/// darker.
+const CONTRAST_PIVOT: f32 = 20.0;
+
+/// The share of its sRGB value table `t` leaves a colour: COLORMAP darkens
+/// close to in proportion, from 1 at table 0 to 1/32 at table 31.
+fn table_brightness(t: f32) -> f32 {
+    1.0 - t / NUMCOLORMAPS as f32
+}
+
+/// Brightness `b` stretched away from the pivot's by `contrast`.
+fn stretched(b: f32, contrast: f32) -> f32 {
+    let pivot = table_brightness(CONTRAST_PIVOT);
+    pivot + (b - pivot) * contrast
+}
+
+/// The gain on every colour's sRGB value that contrast needs: the stretched
+/// brightness of table 0, which can be above 1, since no table is brighter
+/// than the palette. 1 at a contrast of 1 or less.
+pub(crate) fn contrast_gain(contrast: f32) -> f32 {
+    stretched(1.0, contrast).max(1.0)
+}
+
+/// The table to draw `table` in at `contrast`: the one whose brightness,
+/// times [`contrast_gain`], is `table`'s brightness stretched away from
+/// [`CONTRAST_PIVOT`]. Above 1, tables brighter than the pivot get brighter
+/// and darker ones darker, and darker tables keep COLORMAP's own darkening,
+/// hue shift included.
+pub(crate) fn stretch(table: u8, contrast: f32) -> u8 {
+    let b = stretched(table_brightness(table as f32), contrast) / contrast_gain(contrast);
+    let t = (1.0 - b) * NUMCOLORMAPS as f32;
+    t.round().clamp(0.0, (NUMCOLORMAPS - 1) as f32) as u8
+}
+
 /// The glow levels of sector glow: for each COLORMAP table, the level a
 /// surface drawn in it glows at, and for each light level the brightness a
 /// face reading it shows, so that a face lit only by its own surface looks
@@ -145,6 +180,24 @@ mod tests {
         // Level 14 holds the brightest tables, 0 and its neighbours.
         assert!(glow.brightness[14] > 0.9 && glow.brightness[14] <= 1.0);
         assert!(glow.brightness.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn contrast_stretches_tables_away_from_the_pivot() {
+        assert_eq!(contrast_gain(1.0), 1.0);
+        for t in 0..32 {
+            assert_eq!(stretch(t, 1.0), t);
+        }
+        let gain = contrast_gain(1.25);
+        assert!((gain - 1.15625).abs() < 1e-6);
+        let shown = |t: u8| table_brightness(stretch(t, 1.25) as f32) * gain;
+        // Table 0 shows brighter than the palette, through the gain.
+        assert_eq!(stretch(0, 1.25), 0);
+        // Lit rooms brighter, the pivot about the same, dark rooms darker.
+        assert!(shown(10) > table_brightness(10.0));
+        assert!((shown(20) - table_brightness(20.0)).abs() < 0.04);
+        assert!(shown(28) < table_brightness(28.0));
+        assert_eq!(stretch(31, 1.25), 31);
     }
 
     #[test]

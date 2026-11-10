@@ -8,7 +8,8 @@
 // `in_srgb` the brightness scales the colour's sRGB value, as COLORMAP does,
 // instead of its linear value. The
 // look's `minimum_brightness` floors the sky part, so unlit places needn't be
-// pure black. There is no PBR: the crate's sun gate, its voxel brightness and
+// pure black. Last, `gain` scales the sRGB value for the map's contrast.
+// There is no PBR: the crate's sun gate, its voxel brightness and
 // Bevy's ambient light play no part.
 
 import bevy_pbr::render::forward_io::FragmentOutput;
@@ -21,6 +22,7 @@ struct ShaderLight {
     lamp_gain: f32,
     glow_from: f32,
     in_srgb: f32,
+    gain: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0)
@@ -62,6 +64,9 @@ fn fragment(in: VoxelVertexOutput) -> FragmentOutput {
         } else {
             colour = colour * scale;
         }
+    }
+    if light.gain != 1.0 {
+        colour = to_linear(to_srgb(colour) * light.gain);
     }
     out.color = vec4<f32>(colour, 1.0);
     return out;
