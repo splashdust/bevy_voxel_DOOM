@@ -2,8 +2,8 @@
 
 An experiment: vanilla DOOM maps from a WAD file, shown as a
 [`bevy_voxel_world`](https://github.com/splashdust/bevy_voxel_world) voxel
-world you walk through and fight DOOM's monsters in, with a chaingun that
-blows chunks out of the world. It is there to play-test whether a
+world you walk through and fight DOOM's monsters in, with DOOM's weapons,
+which blow chunks out of the world. It is there to play-test whether a
 destructible world adds fun. Every voxel is one colour from DOOM's palette, with
 DOOM's sector light baked in, drawn flat and unlit so the map reads as it does
 in DOOM. With `--light propagated` the crate's light propagation lights it
@@ -16,7 +16,7 @@ The workspace has three parts:
 |---|---|
 | `crates/wad` (`doom_wad`) | reads WAD files: map lumps, the palette, COLORMAP, flats, wall textures, sprites and sounds |
 | `crates/voxelize` (`doom_voxelize`) | turns one map into voxels: `VoxelMap` |
-| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things, doors and lifts, the weapon and its debris |
+| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things, doors and lifts, the weapons, items and keys, and the debris |
 
 ## Running
 
@@ -45,7 +45,9 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | Space | use: open a door, press a switch; in fly mode, also up |
 | C | jump (DOOM has none) |
 | Ctrl | in fly mode, down |
-| left click | fire; hold for a chaingun's rate. The click that captures the cursor doesn't fire |
+| left click | fire; hold to keep firing. The click that captures the cursor doesn't fire |
+| 1 to 7 | pick a weapon, as DOOM's keys do: 1 the fist or chainsaw, 2 the pistol, 3 the shotgun or super shotgun, 4 the chaingun, 5 the rocket launcher, 6 the plasma rifle, 7 the BFG9000 |
+| mouse wheel | the next or previous weapon with ammo |
 | V | switch between walking and the noclip fly camera |
 | R or click | when dead, respawn at the start with full health |
 | Esc | free the cursor; click to capture it again |
@@ -76,17 +78,21 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--fly` | start in the noclip fly camera instead of walking; V switches |
 | `--god` | take no damage |
 | `--health N` | start with N health, 1 to 200 (default 100); an exit switch starts the next map with the health you left with |
+| `--weapons LIST` | start with these weapons besides the fist and pistol, comma-separated from `chainsaw`, `shotgun`, `ssg`, `chaingun`, `rocket`, `plasma`, `bfg`, or `all`. Weapons the WAD has no sprites for (the super shotgun in DOOM) are left out |
+| `--ammo B,S,R,C` | start with this many bullets, shells, rockets and cells, up to the limits, or `full` (default 50,0,0,0) |
+| `--backpack` | start with the backpack, which doubles the ammo limits |
+| `--weapon NAME` | start with this weapon in hand. An exit switch starts the next map with the weapons, ammo, backpack and weapon you left with |
 | `--awake` | monsters start awake, chasing the player |
 | `--freeze` | things stand still and don't think, for screenshots |
 | `--mute` | no sound |
 | `--list-things` | print where each monster stands, in voxels |
 | `--frame-times` | every 5 seconds print frame time statistics and where the monster tics spend their time |
-| `--script STEPS` | once the world has settled, play comma-separated steps: `w:S`, `s:S`, `a:S`, `d:S` walk for S seconds (capitals run), `jw:S` jump while walking, `jump`, `use`, `turn:DEG` (positive left), `pitch:DEG`, `fire:N` shots, `wait:S`, `shot:PATH` save a screenshot, `respawn`. Each step prints the player's position. The cursor isn't captured, and `--screenshot` waits for the script |
+| `--script STEPS` | once the world has settled, play comma-separated steps: `w:S`, `s:S`, `a:S`, `d:S` walk for S seconds (capitals run), `jw:S` jump while walking, `jump`, `use`, `turn:DEG` (positive left), `pitch:DEG`, `fire:N` hold the trigger as long as N chaingun shots take, `weapon:N` press number key N, `wait:S`, `shot:PATH` save a screenshot, `respawn`. Each step prints the player's position. The cursor isn't captured, and `--screenshot` waits for the script |
 | `--pos X,Y,Z` | start the camera (the eye, when walking) here, in voxels, instead of at player 1's start |
 | `--yaw DEG` | start yaw: 0 faces DOOM's north, positive turns left |
 | `--pitch DEG` | start pitch, positive looks up |
-| `--blast-radius R` | the radius in voxels of the ball the player's shots carve, 4 by default |
-| `--fire N` | once the world is ready, fire N shots in a small spiral around the view centre |
+| `--blast-radius R` | the radius in voxels of the ball a bullet carves, 4 by default; the other weapons carve in proportion (see the weapons below) |
+| `--fire N` | once the world is ready, fire N chaingun bullets in a small spiral around the view centre, without ammo |
 | `--debris N` | debris cubes a shot throws out, 16 by default; 0 turns debris off |
 | `--screenshot PATH` | wait until the world in view has been generated and meshed, and its light has settled, save a PNG and exit. With `--fire`, it waits for the carved chunks too, and for debris to settle |
 | `--screenshot-delay S` | take the screenshot S seconds after the last scripted shot, settled or not, to catch debris in the air |
@@ -211,7 +217,10 @@ its north is −z.
   a closing door goes back up from a body in its way, as DOOM's do. Space
   traces DOOM's 64 units from the player along the view's yaw, through
   two-sided lines with an opening, as `P_UseLines` does: the first line
-  with a use special is used from its front side, and a wall says "oof". A
+  with a use special is used from its front side, and a wall says "oof".
+  Keyed doors and switches (DR, D1, SR and S1 blue, yellow and red) do
+  nothing without a key of their colour, key card or skull key, and say
+  which they need. A
   switch flips between its `SW1` and `SW2` textures by editing the world's
   wall voxels (`VoxelMap::switch_voxels`), and a button flips back after a
   second.
@@ -223,8 +232,9 @@ its north is −z.
   map at startup, so a second after the switch the app exits and `main`
   starts the program again for the next map, on Unix in the same process
   through `exec`. The new run keeps the command line's settings, drops the
-  first map's start, script and screenshot, and starts with `--health` set
-  to what the player left with.
+  first map's start, script and screenshot, and starts with `--health`,
+  `--weapons`, `--ammo`, `--backpack` and `--weapon` set to what the player
+  left with. Keys and berserk stay behind, as in DOOM.
 - **Sprites** (`crates/wad/src/sprite.rs`, `src/sprites.rs`). The WAD
   reader lists the sprite lumps between `S_START` and `S_END` (and the
   `SS_` markers) by prefix, frame letter and rotation, a second
@@ -240,10 +250,10 @@ its north is −z.
   are as dark as the room they stand in. Full-bright frames skip the table.
   Each lump, table and mirroring is one image and one unlit, alpha-masked
   material, made the first time it shows. The spectre is drawn dark and
-  see-through instead of DOOM's fuzz. The chaingun is drawn at the bottom
-  centre as DOOM draws weapon sprites on a 320×200 screen, scaled to the
-  window with DOOM's tall pixels, bobbing as the player walks, in the
-  light of the player's sector, its flash full-bright.
+  see-through instead of DOOM's fuzz. The weapon in hand is drawn at the
+  bottom centre as DOOM draws weapon sprites on a 320×200 screen, scaled
+  to the window with DOOM's tall pixels, bobbing as the player walks, in
+  the light of the player's sector, its flash full-bright.
 - **Monsters** (`src/info.rs`, `src/actors.rs`). Things spawn from THINGS
   at skill 3 (flag 2), single player only. Monsters and the barrel run at
   DOOM's 35 tics a second in `FixedUpdate`, drawn between tics. Each
@@ -276,11 +286,30 @@ its north is −z.
     at their pain chance, wakes them when the player did it, and kills
     them: death or gib frames, a corpse that isn't solid and falls if the
     floor goes.
-- **The weapon** (`src/weapon.rs`). A shot is a ray from the camera along
-  its forward vector, spread after the first shot of a burst as DOOM's
-  refire is. It hits the first monster or barrel whose body it crosses,
-  for DOOM's 5 × (1 to 3), leaving blood, or else carves the world within
-  the view distance, leaving a puff. `Carver::carve` does every carve in
+- **Weapons** (`src/weapon.rs`, `src/inventory.rs`). All nine of DOOM's
+  weapons, run as DOOM's player sprite states (p_pspr.c) at 35 tics a
+  second: a weapon raises from the bottom of the screen, waits, fires
+  through its attack frames at DOOM's rates, refires while the trigger is
+  held, and lowers to switch. The player starts with the fist, the pistol
+  and 50 bullets, and each shot takes DOOM's ammo; out of ammo, the weapon
+  lowers and the best one with ammo comes up, as `P_CheckAmmo` picks it.
+  Hitscans are rays from the camera along its forward vector, so they go
+  where the crosshair is, for DOOM's damage and spread: the pistol and
+  chaingun spread after the first shot of a burst, the shotgun fires 7
+  spread pellets and the super shotgun 20, spread up and down too, and the
+  fist and chainsaw reach DOOM's 64 units, the fist ten times as hard with
+  berserk. A ray hits the first monster or barrel whose body it crosses,
+  leaving blood, or else carves the world within the view distance,
+  leaving a puff. The rocket launcher, plasma rifle and BFG9000 fire
+  DOOM's projectiles: a rocket blasts what it can see within 128 units, as
+  P_RadiusAttack does, the player too, and the BFG ball's burst sprays 40
+  tracers from the player across 90°, each for 15 rolls of 1 to 8 on the
+  first thing within 1024 units the player can see. Every attack wakes
+  monsters within 1024 units. How much a weapon carves grows with
+  `--blast-radius` R: a bullet R, a pellet or chainsaw bite R/2, a punch 1
+  (R/2 with berserk), a plasma ball 3R/4, a rocket 2R and the BFG's ball
+  4R; rockets and BFG balls carve where they burst, against a monster too.
+  `Carver::carve` does every carve in
   the app, the player's shots, monsters' bullets and projectiles and
   barrels alike: around the voxel hit, `set_voxels_in` carves a ball whose
   edge is jittered by a hash of each voxel's position, and darkens solid
@@ -289,20 +318,32 @@ its north is −z.
   wants to react to destruction. The darkening starts from the colour
   `VoxelMap::voxel` gives, so carving the same spot again doesn't darken
   it further, and a scorched lamp goes out. Air is never made solid,
-  except for a shot's flash, which rays and bodies pass through. The
+  except for a hitscan's flash, which rays and bodies pass through. The
   scripted shots of `--fire` are spread so the craters sit side by side at
   the distance the centre ray hits.
 - **Barrels.** A barrel is a thing with 20 health that never wakes. Shot
   dead, it plays DOOM's explosion and blasts everything it can see within
   128 units for 128 less the distance, as P_RadiusAttack does, which can
   set off other barrels, then carves a crater 11 voxels in radius.
-- **Items.** Decorations and items stand as billboards, animated and lit
-  like monsters; solid ones block. Only health is picked up: the
-  stimpack, the medikit and the health bonus, with DOOM's amounts and
-  limits. Ammo is unlimited.
+- **Items and keys** (`src/inventory.rs`). Decorations and items stand as
+  billboards, animated and lit like monsters; solid ones block. The
+  player picks up an item by touching it, as p_inter.c
+  `P_TouchSpecialThing` does, with DOOM's message and sound and a yellow
+  flash: health (the stimpack, the medikit and the health bonus), the
+  weapons, ammo (clips, shells, rockets, cells and their boxes), the
+  backpack, the six keys and berserk, with DOOM's amounts and limits. An
+  item the player has no use for stays. A new weapon is switched to, and
+  ammo of a kind the player had none of switches from the fist or pistol to
+  a weapon that fires it, as `P_GiveAmmo` does. Zombies drop a clip,
+  shotgun guys a shotgun and chaingunners a chaingun when they die, worth
+  half a clip or one clip of ammo. The HUD shows the ammo in hand, every
+  ammo count and its limit, the number keys of the weapons owned and the
+  keys held. A dead player who respawns keeps what they found, without
+  berserk, and with at least 50 bullets. Armour, the soul sphere,
+  megasphere and the other powerups are still only shown.
 - **Sound** (`crates/wad/src/sound.rs`, `src/sound.rs`). The `DS` lumps are
   DMX sounds, turned into in-memory WAVs at start and played through
-  bevy_audio: the gun, monsters' sight, attack, pain, death and active
+  bevy_audio: the weapons, monsters' sight, attack, pain, death and active
   sounds, projectiles and their bursts, barrels, the player's pain and
   death, and pickups. Volume falls off with distance as DOOM's does, full
   within 200 units and silent past 1200, with at most a dozen sounds at
@@ -368,8 +409,7 @@ its north is −z.
 - Animated flats and textures show their first frame.
 - Only the use key moves sectors: lines set off by walking over or shooting
   them do nothing, and their doors stay baked open. Stairs, donuts,
-  crushers, light changes and sector specials don't happen, and keys
-  aren't needed. A sector moves one plane, the one its first special
+  crushers, light changes and sector specials don't happen. A sector moves one plane, the one its first special
   names. Specials work out their heights from the map's stored ones, so an
   SR floor raise goes to the same height each time, where DOOM's goes on
   to the next. Walk-over exits do nothing, and a new map opens a new

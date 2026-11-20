@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use doom_wad::{MapData, ML_TWOSIDED};
 
+use crate::inventory::KeyColour;
+
 /// DOOM's door speed and wait (p_spec.h `VDOORSPEED`, `VDOORWAIT`), in map
 /// units and tics.
 pub const DOOR_SPEED: f32 = 2.0;
@@ -90,10 +92,12 @@ pub struct LineUse {
     /// Usable again (DR and SR lines); otherwise its special goes after one
     /// use, as `P_UseSpecialLine` clears it.
     pub repeat: bool,
+    /// The key it needs: p_doors.c `EV_VerticalDoor` and `EV_DoLockedDoor`.
+    pub key: Option<KeyColour>,
 }
 
 /// The use special `special`, from p_switch.c `P_UseSpecialLine` and
-/// p_doors.c `EV_VerticalDoor`. Keyed doors open without their key.
+/// p_doors.c `EV_VerticalDoor` and `EV_DoLockedDoor`.
 pub fn line_use(special: u16) -> Option<LineUse> {
     use DoorOp::*;
     use Effect::*;
@@ -131,10 +135,17 @@ pub fn line_use(special: u16) -> Option<LineUse> {
         51 => (Exit { secret: true }, false, false),
         _ => return None,
     };
+    let key = match special {
+        26 | 32 | 99 | 133 => Some(KeyColour::Blue),
+        27 | 34 | 136 | 137 => Some(KeyColour::Yellow),
+        28 | 33 | 134 | 135 => Some(KeyColour::Red),
+        _ => None,
+    };
     Some(LineUse {
         effect,
         manual,
         repeat,
+        key,
     })
 }
 
@@ -470,6 +481,17 @@ mod tests {
         assert!(line_use(1).unwrap().manual);
         assert!(!line_use(31).unwrap().repeat);
         assert_eq!(line_use(11).unwrap().effect, Effect::Exit { secret: false });
+        // Keyed doors: manual ones and locked switches.
+        assert_eq!(line_use(1).unwrap().key, None);
+        assert_eq!(line_use(26).unwrap().key, Some(KeyColour::Blue));
+        assert_eq!(line_use(27).unwrap().key, Some(KeyColour::Yellow));
+        assert_eq!(line_use(28).unwrap().key, Some(KeyColour::Red));
+        assert_eq!(line_use(33).unwrap().key, Some(KeyColour::Red));
+        assert_eq!(line_use(34).unwrap().key, Some(KeyColour::Yellow));
+        assert_eq!(line_use(99).unwrap().key, Some(KeyColour::Blue));
+        assert_eq!(line_use(135).unwrap().key, Some(KeyColour::Red));
+        assert_eq!(line_use(137).unwrap().key, Some(KeyColour::Yellow));
+        assert!(!line_use(137).unwrap().manual && !line_use(137).unwrap().repeat);
         // Walk-over door and lift.
         assert!(line_use(2).is_none());
         assert!(line_use(88).is_none());

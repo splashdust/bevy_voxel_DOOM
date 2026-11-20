@@ -19,13 +19,22 @@
 //! can see and carves a big crater.
 //!
 //! Damage is queued as [`Hit`]s and applied once a tic, so any source, the
-//! player's gun included, damages things the same way.
+//! player's gun included, damages things the same way. The player's
+//! rockets, plasma and BFG balls fly as monsters' projectiles do: a rocket
+//! blasts what it can see within 128 units, the player too, and a BFG
+//! ball's burst sprays 40 tracers from the player across 90°.
+//!
+//! Items are picked up when the player touches them (see
+//! `Player::pick_up`). Zombies drop a clip, shotgun guys a shotgun and
+//! chaingunners a chaingun when they die, worth less than ones placed in
+//! the map.
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use doom_wad::Thing;
 
 use crate::collide::{move_among, ray_cylinder, trace, Blocker, Body, Solid};
+use crate::hud::HudMessage;
 use crate::info::{
     self, Action, DecorInfo, Frame, MissileInfo, MonsterInfo, SeqKind, Then,
 };
@@ -50,8 +59,13 @@ const GRAVITY: f32 = 1.0;
 /// radius, in voxels.
 const BLAST_RANGE: f32 = 128.0;
 const BARREL_CRATER: i32 = 11;
-/// A projectile's crater and a missed bullet's pit, in voxels.
+/// A monster's projectile's crater and a missed bullet's pit, in voxels.
 const MISSILE_CRATER: i32 = 3;
+/// How far a BFG tracer reaches, in units, and how many there are.
+const BFG_RANGE: f32 = 1024.0;
+const BFG_TRACERS: u32 = 40;
+/// DOOM's item radius, in units.
+const ITEM_RADIUS: f32 = 20.0;
 const BULLET_PIT: i32 = 1;
 /// Tics between sight checks, awake and asleep.
 const SIGHT_EVERY_AWAKE: u64 = 3;
@@ -355,6 +369,8 @@ pub struct Decor {
     frame: usize,
     tics: i32,
     feet: Vec3,
+    /// Dropped by a monster: worth less.
+    dropped: bool,
 }
 
 /// A projectile.
@@ -364,8 +380,10 @@ pub struct Missile {
     /// Its bottom, as DOOM's z, in voxels; `vel` in voxels a tic.
     pos: Vec3,
     vel: Vec3,
-    owner: Option<Entity>,
+    owner: Who,
     owner_info: Option<&'static MonsterInfo>,
+    /// The crater it carves, in voxels.
+    crater: i32,
     bursting: bool,
     frame: usize,
     tics: i32,
@@ -445,20 +463,7 @@ fn spawn_things(
             } else {
                 floor as f32
             };
-            let feet = Vec3::new(x, y, z);
-            let mut board = Billboard::new(info.sprite, letter, feet);
-            board.facing = angle;
-            board.bright = info.frames[0].bright;
-            commands.spawn((
-                Decor {
-                    info,
-                    frame: 0,
-                    tics: info.frames[0].tics,
-                    feet,
-                },
-                board,
-                billboard_bundle(&bank),
-            ));
+            spawn_decor(&mut commands, &bank, info, Vec3::new(x, y, z), angle, false);
             decor += 1;
         }
     }
@@ -991,65 +996,211 @@ impl Ctx<'_, '_, '_> {
         let tics = (flat / speed).max(1.0);
         let vel = heading(angle) * speed + Vec3::Y * (dest.y - pos.y) / tics;
         self.sound(info.sound, pos);
-        let mut board = Billboard::new(info.sprite, info.fly[0].letter, pos);
-        board.bright = true;
-        self.p.commands.spawn((
-            Missile {
-                info,
-                // P_CheckMissileSpawn: half a tic's move out of the shooter.
-                pos,
-                vel,
-                owner: Some(e),
-                owner_info: Some(a.info),
-                bursting: false,
-                frame: 0,
-                tics: info.fly[0].tics,
-                age: 0,
-            },
-            board,
-            billboard_bundle(&self.p.bank),
-        ));
+        spawn_missile(
+            &mut self.p.commands,
+            &self.p.bank,
+            info,
+            pos,
+            vel,
+            Who::Actor(e),
+            Some(a.info),
+            MISSILE_CRATER,
+        );
     }
 
     /// A barrel's blast: P_RadiusAttack with 128, then a crater.
     fn explode(&mut self, e: Entity, a: &Actor) {
         let s = self.s();
         let centre = a.feet + Vec3::Y * 4.0 / s;
-        let range = BLAST_RANGE / s;
-        let mut victims: Vec<(Who, Vec3, f32, f32)> = self
-            .targets
-            .iter()
-            .filter(|t| t.0 != e)
-            .map(|t| (Who::Actor(t.0), t.1, t.2, t.3))
-            .collect();
-        if self.player.alive() {
-            let p = self.player;
-            victims.push((Who::Player, p.feet, p.body().radius, p.body().height));
-        }
-        for (who, feet, radius, height) in victims {
-            let gap = (feet.x - centre.x).abs().max((feet.z - centre.z).abs()) - radius;
-            let dist = gap.max(0.0);
-            if dist >= range || (feet.y + height / 2.0 - centre.y).abs() > range {
-                continue;
-            }
-            let to = feet + Vec3::Y * height / 2.0 - centre;
-            let len = to.length();
-            if len > 1e-3 && trace(&self.world, centre, to / len, len).is_some() {
-                continue;
-            }
-            self.p.queue.0.push(Hit {
-                target: who,
-                amount: ((range - dist) * s) as i32,
-                source: a.killer,
-                from: centre,
-            });
-        }
+        let targets: Vec<_> = self.targets.iter().filter(|t| t.0 != e).copied().collect();
+        let hits = radius_attack(
+            &self.world,
+            self.player,
+            &targets,
+            centre,
+            BLAST_RANGE,
+            a.killer,
+            s,
+        );
+        self.p.queue.0.extend(hits);
         self.p.carver.carve(
             centre.floor().as_ivec3() - IVec3::Y * 2,
             None,
             BARREL_CRATER,
         );
     }
+}
+
+/// p_map.c `P_RadiusAttack`: `damage` less the distance, in units, to
+/// everything within `damage` units of `centre` that it can see, measured
+/// to the edge of the body's box. The player is hurt by their own rockets.
+fn radius_attack(
+    world: &impl Solid,
+    player: &Player,
+    targets: &[(Entity, Vec3, f32, f32, &'static MonsterInfo)],
+    centre: Vec3,
+    damage: f32,
+    source: Who,
+    s: f32,
+) -> Vec<Hit> {
+    let range = damage / s;
+    let mut victims: Vec<(Who, Vec3, f32, f32)> = targets
+        .iter()
+        .map(|t| (Who::Actor(t.0), t.1, t.2, t.3))
+        .collect();
+    if player.alive() {
+        victims.push((
+            Who::Player,
+            player.feet,
+            player.body().radius,
+            player.body().height,
+        ));
+    }
+    let mut hits = Vec::new();
+    for (who, feet, radius, height) in victims {
+        let gap = (feet.x - centre.x).abs().max((feet.z - centre.z).abs()) - radius;
+        let dist = gap.max(0.0);
+        if dist >= range || (feet.y + height / 2.0 - centre.y).abs() > range {
+            continue;
+        }
+        let to = feet + Vec3::Y * height / 2.0 - centre;
+        let len = to.length();
+        if len > 1e-3 && trace(world, centre, to / len, len).is_some() {
+            continue;
+        }
+        hits.push(Hit {
+            target: who,
+            amount: ((range - dist) * s) as i32,
+            source,
+            from: centre,
+        });
+    }
+    hits
+}
+
+/// Launches a projectile from `pos`, its bottom as DOOM's z, at `vel` in
+/// voxels a tic. It never hits `owner`; `owner_info` is a monster's own
+/// kind, which its projectiles don't hurt. It carves `crater` voxels.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_missile(
+    commands: &mut Commands,
+    bank: &SpriteBank,
+    info: &'static MissileInfo,
+    pos: Vec3,
+    vel: Vec3,
+    owner: Who,
+    owner_info: Option<&'static MonsterInfo>,
+    crater: i32,
+) {
+    let mut board = Billboard::new(info.sprite, info.fly[0].letter, pos);
+    board.bright = true;
+    commands.spawn((
+        Missile {
+            info,
+            pos,
+            vel,
+            owner,
+            owner_info,
+            crater,
+            bursting: false,
+            frame: 0,
+            tics: info.fly[0].tics,
+            age: 0,
+        },
+        board,
+        billboard_bundle(bank),
+    ));
+}
+
+/// p_pspr.c `A_BFGSpray`: 40 tracers from the player across 90° about
+/// `angle`, the way the ball flew, each hitting the first thing it crosses
+/// within 1024 units that the player can see, for 15 rolls of 1 to 8.
+/// Returns the hits and where each landed.
+fn bfg_spray(
+    world: &impl Solid,
+    player: &Player,
+    targets: &[(Entity, Vec3, f32, f32, &'static MonsterInfo)],
+    angle: f32,
+    rng: &mut Rng,
+    s: f32,
+) -> Vec<(Hit, Vec3)> {
+    let from = player.feet.xz();
+    let eye = player.eye();
+    let reach = BFG_RANGE / s;
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let mut hits = Vec::new();
+    for i in 0..BFG_TRACERS {
+        let an = angle - quarter / 2.0 + quarter / BFG_TRACERS as f32 * i as f32;
+        let dir = heading(an).xz();
+        let first = targets
+            .iter()
+            .filter_map(|&(e, feet, radius, height, _)| {
+                let t = ray_circle(from, dir, feet.xz(), radius)?;
+                (t <= reach).then_some((t, e, feet + Vec3::Y * height / 2.0))
+            })
+            .filter(|&(_, _, centre)| {
+                let to = centre - eye;
+                let len = to.length();
+                len < 1e-3 || trace(world, eye, to / len, len).is_none()
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((_, e, centre)) = first else {
+            continue;
+        };
+        let amount = (0..15).map(|_| (rng.next() & 7) + 1).sum();
+        hits.push((
+            Hit {
+                target: Who::Actor(e),
+                amount,
+                source: Who::Player,
+                from: eye,
+            },
+            centre,
+        ));
+    }
+    hits
+}
+
+/// Where the 2D ray from `from` along unit `dir` first enters the circle,
+/// as a distance along it; `Some(0)` from inside.
+fn ray_circle(from: Vec2, dir: Vec2, centre: Vec2, radius: f32) -> Option<f32> {
+    let to = centre - from;
+    let along = to.dot(dir);
+    let off = to.length_squared() - along * along;
+    if off > radius * radius {
+        return None;
+    }
+    let half = (radius * radius - off).sqrt();
+    let enter = along - half;
+    if along + half < 0.0 {
+        return None;
+    }
+    Some(enter.max(0.0))
+}
+
+/// Spawns decoration or item `info` with its feet at `feet`.
+fn spawn_decor(
+    commands: &mut Commands,
+    bank: &SpriteBank,
+    info: &'static DecorInfo,
+    feet: Vec3,
+    angle: f32,
+    dropped: bool,
+) {
+    let mut board = Billboard::new(info.sprite, info.frames[0].letter, feet);
+    board.facing = angle;
+    board.bright = info.frames[0].bright;
+    commands.spawn((
+        Decor {
+            info,
+            frame: 0,
+            tics: info.frames[0].tics,
+            feet,
+            dropped,
+        },
+        board,
+        billboard_bundle(bank),
+    ));
 }
 
 /// The frame after `a`'s current one, or `None` when it vanishes.
@@ -1328,6 +1479,7 @@ fn tic_missiles(
     player: Single<&Player>,
     actors: Query<(Entity, &Actor)>,
     mut missiles: Query<(Entity, &mut Missile, &mut Billboard)>,
+    bank: Res<SpriteBank>,
 ) {
     let s = map.units;
     let world = carver.solid();
@@ -1348,6 +1500,27 @@ fn tic_missiles(
                 };
                 m.tics = frame.tics;
                 board.letter = frame.letter;
+                // The BFG's third burst frame sprays its tracers.
+                if m.info.spray
+                    && m.frame == 2
+                    && m.owner == Who::Player
+                    && player.alive()
+                {
+                    let angle = angle_to(Vec3::ZERO, m.vel);
+                    for (hit, at) in
+                        bfg_spray(&world, &player, &targets, angle, &mut rng, s)
+                    {
+                        queue.0.push(hit);
+                        spawn_effect(
+                            &mut commands,
+                            &bank,
+                            "BFE2",
+                            info::BFG_HIT,
+                            at,
+                            0.0,
+                        );
+                    }
+                }
             }
             board.place(m.pos);
             continue;
@@ -1386,7 +1559,7 @@ fn tic_missiles(
         let wall = trace(&world, centre, dir, length);
         let mut best = wall.map_or(length, |h| h.distance);
         let mut hit_who = None;
-        if player.alive() {
+        if player.alive() && m.owner != Who::Player {
             let b = player.body();
             if let Some(t) = ray_cylinder(
                 centre,
@@ -1401,7 +1574,7 @@ fn tic_missiles(
             }
         }
         for &(te, feet, r, h, info) in &targets {
-            if Some(te) == m.owner {
+            if Who::Actor(te) == m.owner {
                 continue;
             }
             if let Some(t) = ray_cylinder(
@@ -1421,6 +1594,8 @@ fn tic_missiles(
             }
         }
         m.pos += dir * best;
+        // Rockets and the BFG's ball carve where they burst, things or not.
+        let big = m.info.blast > 0.0 || m.info.spray;
         let burst = match (hit_who, wall) {
             (Some(who), _) => {
                 if who != Who::Nobody {
@@ -1428,19 +1603,39 @@ fn tic_missiles(
                     queue.0.push(Hit {
                         target: who,
                         amount: damage,
-                        source: m.owner.map_or(Who::Nobody, Who::Actor),
+                        source: m.owner,
                         from: m.pos - dir,
                     });
+                }
+                if big {
+                    carver.carve(
+                        (m.pos + Vec3::Y * half).floor().as_ivec3(),
+                        None,
+                        m.crater,
+                    );
                 }
                 true
             }
             (None, Some(hit)) => {
-                carver.carve(hit.voxel, Some(hit.normal), MISSILE_CRATER);
+                carver.carve(hit.voxel, Some(hit.normal), m.crater);
                 true
             }
             (None, None) => false,
         };
         if burst {
+            if m.info.blast > 0.0 {
+                // A_Explode, from where it burst; what it hit took its hit.
+                let hits = radius_attack(
+                    &world,
+                    &player,
+                    &targets,
+                    m.pos + Vec3::Y * half,
+                    m.info.blast,
+                    m.owner,
+                    s,
+                );
+                queue.0.extend(hits);
+            }
             m.pos -= dir * radius.min(best);
             m.bursting = true;
             m.frame = 0;
@@ -1454,7 +1649,10 @@ fn tic_missiles(
 }
 
 /// Lands queued damage: P_DamageMobj.
+#[allow(clippy::too_many_arguments)]
 fn apply_damage(
+    mut commands: Commands,
+    bank: Res<SpriteBank>,
     map: Res<GameMap>,
     mut rng: ResMut<Rng>,
     mut queue: ResMut<DamageQueue>,
@@ -1497,6 +1695,9 @@ fn apply_damage(
                 }
                 a.health -= hit.amount;
                 if a.health <= 0 {
+                    if let Some(item) = info::drop_of(a.info.doomednum) {
+                        spawn_decor(&mut commands, &bank, item, a.feet, a.angle, true);
+                    }
                     a.shootable = false;
                     a.float = a.info.doomednum == info::LOST_SOUL.doomednum;
                     a.height /= 4.0;
@@ -1531,23 +1732,31 @@ fn push(from: Vec3, to: Vec3, damage: i32, mass: f32, s: f32) -> Vec3 {
     dir * damage as f32 / 8.0 * 100.0 / mass / s
 }
 
-/// Animates decorations and items, and picks up health.
+/// Animates decorations and items, and picks up the items the player
+/// touches: their boxes overlap, as p_map.c `PIT_CheckThing` has it, the
+/// item no higher than the player's head and no more than 8 units under
+/// their feet.
 fn tic_decor(
     mut commands: Commands,
+    map: Res<GameMap>,
     mut sounds: MessageWriter<PlaySound>,
+    mut message: ResMut<HudMessage>,
     mut player: Single<&mut Player>,
     mut decor: Query<(Entity, &mut Decor, &mut Billboard)>,
 ) {
-    let reach = player.body().radius;
+    let s = map.units;
+    let reach = player.body().radius + ITEM_RADIUS / s;
     for (e, mut d, mut board) in &mut decor {
-        if let Some((gives, up_to)) = d.info.health {
+        if let Some(item) = d.info.pickup {
             let gap = (d.feet.x - player.feet.x)
                 .abs()
                 .max((d.feet.z - player.feet.z).abs());
-            let near = gap < reach + 10.0
-                && (d.feet.y - player.feet.y).abs() < player.body().height;
-            if near && player.heal(gives, up_to) {
-                sounds.write(PlaySound::global("ITEMUP"));
+            let above = d.feet.y - player.feet.y;
+            let near = gap < reach && above <= player.body().height && above >= -8.0 / s;
+            if let Some(picked) = near.then(|| player.pick_up(item, d.dropped)).flatten()
+            {
+                sounds.write(PlaySound::global(picked.sound));
+                message.say(picked.message);
                 commands.entity(e).despawn();
                 continue;
             }
@@ -1623,6 +1832,25 @@ mod tests {
         assert!(heading(std::f32::consts::FRAC_PI_2).abs_diff_eq(Vec3::NEG_Z, 1e-6));
         let a = angle_to(Vec3::ZERO, Vec3::new(0.0, 0.0, -5.0));
         assert!((a - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rays_enter_circles_at_their_edge() {
+        let t = ray_circle(Vec2::ZERO, Vec2::X, Vec2::new(10.0, 0.0), 2.0).unwrap();
+        assert!((t - 8.0).abs() < 1e-5);
+        assert_eq!(
+            ray_circle(Vec2::ZERO, Vec2::X, Vec2::new(10.0, 3.0), 2.0),
+            None
+        );
+        assert_eq!(
+            ray_circle(Vec2::ZERO, Vec2::X, Vec2::new(-10.0, 0.0), 2.0),
+            None,
+            "behind"
+        );
+        assert_eq!(
+            ray_circle(Vec2::ZERO, Vec2::X, Vec2::new(1.0, 0.0), 2.0),
+            Some(0.0)
+        );
     }
 
     #[test]

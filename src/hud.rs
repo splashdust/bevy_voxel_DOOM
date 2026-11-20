@@ -1,14 +1,17 @@
 //! The overlay: a line of status text (map, scale, light mode, position,
 //! the propagated light there, monsters awake, frame rate), a crosshair,
-//! the chaingun at the bottom centre, health, and the red of damage and
-//! death.
+//! the weapon in hand at the bottom centre, health, the ammo of the weapon
+//! in hand, every ammo count and limit, the weapons owned by number key,
+//! the keys held, messages such as pickups', and the red of damage and
+//! death and yellow of a pickup.
 //!
-//! The chaingun is drawn as DOOM draws its weapon sprites on a 320×200
-//! screen: the patch's top-left at `(1 − left_offset, 32 − top_offset)`,
-//! moved by the walking bob, scaled to the window's height with DOOM's tall
-//! pixels (200 lines across the height, 240 columns' width per height). It
-//! takes the light of the sector the player stands in; the muzzle flash is
-//! full-bright.
+//! The weapon is drawn as DOOM draws its weapon sprites on a 320×200
+//! screen: the patch's top-left at `(1 − left_offset, sy − top_offset)`,
+//! `sy` 32 in hand and lower while it raises or lowers, moved by the
+//! walking bob while it waits to fire, scaled to the window's height with
+//! DOOM's tall pixels (200 lines across the height, 240 columns' width per
+//! height). It takes the light of the sector the player stands in; the
+//! muzzle flash is full-bright.
 
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
@@ -20,7 +23,7 @@ use bevy_voxel_world::prelude::*;
 
 use crate::actors::{census, Actor};
 use crate::camera::FlyCamera;
-use crate::info::{CHAINGUN_FLASH, CHAINGUN_SPRITE};
+use crate::inventory::{AmmoKind, Key, WeaponKind};
 use crate::player::{Mode, Player};
 use crate::sprites::SpriteBank;
 use crate::weapon::Weapon;
@@ -35,8 +38,45 @@ pub struct MapLabel {
     pub light: &'static str,
 }
 
+/// hu_stuff.c `HU_MSGTIMEOUT`: seconds a message shows.
+const MESSAGE_SECONDS: f32 = 4.0;
+
+/// The message line: a pickup, a locked door. Messages are printed too.
+#[derive(Resource, Default)]
+pub struct HudMessage {
+    text: String,
+    left: f32,
+}
+
+impl HudMessage {
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.left = MESSAGE_SECONDS;
+        println!("message: {}", self.text);
+    }
+}
+
 #[derive(Component)]
 pub struct HudText;
+
+/// The parts of the status panel that show the inventory.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Message,
+    /// The ammo of the weapon in hand.
+    Ammo,
+    /// Every ammo count and limit.
+    AmmoTable,
+    /// Number key `n`: lit when a weapon on it is owned.
+    Arms(u8),
+}
+
+/// A key's icon, shown while it is held.
+#[derive(Component)]
+pub struct KeyIcon(Key);
+
+/// The height of a key icon, in logical pixels.
+const KEY_ICON: f32 = 22.0;
 
 #[derive(Component)]
 pub struct HealthText;
@@ -112,6 +152,91 @@ pub fn spawn_hud(mut commands: Commands) {
         GlobalZIndex(3),
         HealthText,
     ));
+    commands.spawn((
+        Text::new(""),
+        TextFont {
+            font_size: FontSize::Px(16.0),
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        TextShadow::default(),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(44.0),
+            left: Val::Px(8.0),
+            ..default()
+        },
+        GlobalZIndex(4),
+        Status::Message,
+    ));
+    // Bottom right: the ammo in hand, every ammo, the arms and the keys.
+    let label = |size: f32| TextFont {
+        font_size: FontSize::Px(size),
+        ..default()
+    };
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(10.0),
+                right: Val::Px(16.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexEnd,
+                row_gap: Val::Px(4.0),
+                ..default()
+            },
+            GlobalZIndex(3),
+        ))
+        .with_children(|panel| {
+            panel
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(4.0),
+                    ..default()
+                })
+                .with_children(|keys| {
+                    for key in Key::ALL {
+                        keys.spawn((
+                            ImageNode::default(),
+                            Node::default(),
+                            Visibility::Hidden,
+                            KeyIcon(key),
+                        ));
+                    }
+                });
+            panel
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(7.0),
+                    ..default()
+                })
+                .with_children(|arms| {
+                    for n in 1..=7 {
+                        arms.spawn((
+                            Text::new(n.to_string()),
+                            label(16.0),
+                            TextColor(Color::srgb(0.35, 0.35, 0.35)),
+                            TextShadow::default(),
+                            Status::Arms(n),
+                        ));
+                    }
+                });
+            panel.spawn((
+                Text::new(""),
+                label(13.0),
+                TextColor(Color::srgb(0.9, 0.85, 0.6)),
+                TextShadow::default(),
+                TextLayout::justify(Justify::Right),
+                Status::AmmoTable,
+            ));
+            panel.spawn((
+                Text::new(""),
+                label(36.0),
+                TextColor(Color::srgb(0.85, 0.1, 0.1)),
+                TextShadow::default(),
+                Status::Ammo,
+            ));
+        });
     commands.spawn((
         Text::new(""),
         TextFont {
@@ -203,11 +328,101 @@ pub fn update_hud(
     } else {
         String::new()
     };
-    let alpha = if dead { 0.55 } else { player.hurt * 0.6 };
-    red.0 = Color::srgba(0.8, 0.0, 0.0, alpha);
+    red.0 = if dead {
+        Color::srgba(0.8, 0.0, 0.0, 0.55)
+    } else if player.hurt >= player.bonus {
+        Color::srgba(0.8, 0.0, 0.0, player.hurt * 0.6)
+    } else {
+        Color::srgba(0.85, 0.7, 0.2, player.bonus * 0.4)
+    };
 }
 
-/// Places the chaingun and its flash.
+/// Fills in the inventory panel and the message line.
+pub fn update_status(
+    time: Res<Time>,
+    mut message: ResMut<HudMessage>,
+    player: Single<&Player, With<FlyCamera>>,
+    mut texts: Query<(&Status, &mut Text, &mut TextColor)>,
+) {
+    message.left -= time.delta_secs();
+    let inventory = &player.inventory;
+    for (status, mut text, mut colour) in &mut texts {
+        let content = match *status {
+            Status::Message => {
+                if message.left > 0.0 {
+                    message.text.clone()
+                } else {
+                    String::new()
+                }
+            }
+            Status::Ammo => inventory
+                .ready
+                .ammo()
+                .map_or(String::new(), |kind| inventory.ammo(kind).to_string()),
+            Status::AmmoTable => AmmoKind::ALL
+                .iter()
+                .map(|&kind| {
+                    format!(
+                        "{} {:>3} / {}",
+                        kind.label(),
+                        inventory.ammo(kind),
+                        inventory.max(kind)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Status::Arms(n) => {
+                let owned = WeaponKind::ALL
+                    .into_iter()
+                    .any(|w| w.slot() == n && inventory.has(w));
+                let wanted = Color::srgb(0.95, 0.8, 0.2);
+                let in_hand = inventory.pending.unwrap_or(inventory.ready).slot() == n;
+                let want = match (owned, in_hand) {
+                    (_, true) => Color::WHITE,
+                    (true, false) => wanted,
+                    (false, false) => Color::srgb(0.35, 0.35, 0.35),
+                };
+                if colour.0 != want {
+                    colour.0 = want;
+                }
+                continue;
+            }
+        };
+        if text.0 != content {
+            text.0 = content;
+        }
+    }
+}
+
+/// Shows the keys held, as their items' sprites.
+pub fn draw_keys(
+    map: Res<GameMap>,
+    player: Single<&Player, With<FlyCamera>>,
+    mut bank: ResMut<SpriteBank>,
+    mut images: ResMut<Assets<Image>>,
+    mut icons: Query<(&KeyIcon, &mut ImageNode, &mut Node, &mut Visibility)>,
+) {
+    for (icon, mut image, mut node, mut visibility) in &mut icons {
+        let held = player.inventory.holds(icon.0);
+        let found = held
+            .then(|| bank.ui_image(icon.0.sprite(), b'A', 0, &map, &mut images))
+            .flatten();
+        let Some((handle, patch)) = found else {
+            visibility.set_if_neq(Visibility::Hidden);
+            continue;
+        };
+        if image.image != handle {
+            image.image = handle;
+        }
+        let pic = &patch.picture;
+        let scale = KEY_ICON / pic.height.max(1) as f32;
+        node.width = Val::Px(pic.width as f32 * scale * 1.2);
+        node.height = Val::Px(KEY_ICON);
+        visibility.set_if_neq(Visibility::Inherited);
+    }
+}
+
+/// Places the weapon in hand and its flash.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_gun(
     time: Res<Time>,
@@ -221,18 +436,17 @@ pub fn draw_gun(
     mut phase: Local<f32>,
 ) {
     let player = *camera;
-    let firing = weapon.since_shot < crate::weapon::SHOT_INTERVAL * 1.5;
-    // DOOM's bob: up to 16 units, a turn every 64 tics.
+    // DOOM's bob: up to 16 units, a turn every 64 tics, while it waits.
     *phase += time.delta_secs() * 35.0 / 64.0 * std::f32::consts::TAU;
     let speed_units = player.ground_speed * map.units / 35.0;
-    let bob = if firing || !player.grounded {
+    let bob = if !weapon.bobbing() || !player.grounded {
         0.0
     } else {
         (speed_units * speed_units / 4.0).min(16.0)
     };
     let (sx, sy) = (
         1.0 + bob * phase.cos(),
-        32.0 + bob * (*phase % std::f32::consts::PI).sin(),
+        weapon.sy + bob * (*phase % std::f32::consts::PI).sin(),
     );
     let table = if map.sector_light {
         map.map
@@ -242,23 +456,20 @@ pub fn draw_gun(
     };
     let height = window.height();
     let (px_w, px_h) = (height / 240.0, height / 200.0);
-    let flash_on = weapon.since_shot < 5.0 / 35.0;
-    let odd = weapon.shots.is_multiple_of(2);
+    let inventory = &player.inventory;
     for (gun, mut image, mut node, mut visibility) in &mut sprites {
-        let (sprite, letter, table) = if gun.flash {
-            (CHAINGUN_FLASH, if odd { b'B' } else { b'A' }, 0)
+        let frame = if gun.flash {
+            weapon
+                .flash_frame(inventory)
+                .map(|(sprite, letter)| (sprite, letter, 0))
         } else {
-            (
-                CHAINGUN_SPRITE,
-                if firing && odd { b'B' } else { b'A' },
-                table,
-            )
+            let (sprite, letter, bright) = weapon.frame(inventory);
+            Some((sprite, letter, if bright { 0 } else { table }))
         };
-        let show =
-            player.alive() && player.mode == Mode::Walk && (!gun.flash || flash_on);
-        let found = show
-            .then(|| bank.ui_image(sprite, letter, table, &map, &mut images))
-            .flatten();
+        let show = player.mode == Mode::Walk && weapon.sy < 128.0;
+        let found = frame.filter(|_| show).and_then(|(sprite, letter, table)| {
+            bank.ui_image(sprite, letter, table, &map, &mut images)
+        });
         let Some((handle, patch)) = found else {
             visibility.set_if_neq(Visibility::Hidden);
             continue;

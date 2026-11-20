@@ -152,6 +152,11 @@ impl SpriteBank {
         found
     }
 
+    /// Whether the WAD has frame `letter` of `sprite`.
+    pub fn has(&self, sprite: &str, letter: u8) -> bool {
+        self.set.get(sprite, letter, 1).is_some()
+    }
+
     /// The patch of frame `letter` of `sprite` as seen from the front.
     pub fn patch(&mut self, sprite: &'static str, letter: u8) -> Option<Arc<Patch>> {
         let (lump, _) = self.frame(sprite, letter, 1)?;

@@ -1,11 +1,25 @@
-//! The player's chaingun, and the one place the world is destroyed.
+//! The player's weapons, and the one place the world is destroyed.
 //!
-//! The trigger (left mouse, or a script) fires at a DOOM chaingun's rate.
-//! A shot is a ray from the camera along its forward vector, spread a
-//! little after the first shot of a burst as DOOM's refire is. It hits the
-//! first monster or barrel whose body it crosses, for DOOM's 5 × (1 to 3)
-//! damage, or else carves the first solid voxel within the view distance.
-//! Every shot wakes monsters within 1024 units.
+//! The weapon in hand runs DOOM's player sprite states (p_pspr.c) at 35
+//! tics a second: it raises from the bottom of the screen, waits, fires on
+//! the trigger through its attack frames at DOOM's rates, refires while the
+//! trigger is held, and lowers to switch. The number keys pick a weapon as
+//! DOOM's do (1 the fist or chainsaw, 3 the shotgun or super shotgun), and
+//! the mouse wheel steps through the weapons with ammo. Each shot takes its
+//! ammo; out of ammo, the weapon lowers and the best one left comes up.
+//!
+//! Hitscans are rays from the camera along its forward vector, so they go
+//! where the crosshair is, spread as DOOM spreads them: the pistol and
+//! chaingun after the first shot of a burst, every pellet of the shotguns,
+//! and the fist and chainsaw within DOOM's 64 units. A ray hits the first
+//! monster or barrel whose body it crosses for DOOM's damage, or else
+//! carves the first solid voxel it reaches. The rocket launcher, plasma
+//! rifle and BFG fire projectiles (see `actors`). Every attack wakes
+//! monsters within 1024 units.
+//!
+//! How much each weapon carves grows with `--blast-radius` R (4 voxels by
+//! default): a bullet R, a pellet or chainsaw bite R/2, a punch 1 (R/2 with
+//! berserk), a plasma ball 3R/4, a rocket 2R and the BFG's ball 4R.
 //!
 //! [`Carver::carve`] does every carve: the player's shots, monsters'
 //! bullets and projectiles, and barrels. It blows a rough ball out of the
@@ -14,14 +28,14 @@
 //! darkened from the colour the map generates there, so carving the same
 //! spot again doesn't darken it further.
 //!
-//! `--fire N` fires N shots by itself once the world has settled, spread in
-//! a fixed pattern around the view centre.
+//! `--fire N` fires N chaingun bullets by itself once the world has
+//! settled, spread in a fixed pattern around the view centre, without ammo.
 //!
-//! In the light modes that propagate light, a player's shot also flashes:
-//! the voxel just in front of the face it hits, along the face's normal,
-//! glows for `--flash-time` seconds and goes back to air. The ray came
-//! through that voxel, so it is air, and the carve leaves it alone, since it
-//! only empties solid voxels. Rays and bodies pass through flashes.
+//! In the light modes that propagate light, a hitscan also flashes: the
+//! voxel just in front of the face it hits, along the face's normal, glows
+//! for `--flash-time` seconds and goes back to air. The ray came through
+//! that voxel, so it is air, and the carve leaves it alone, since it only
+//! empties solid voxels. Rays and bodies pass through flashes.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,12 +45,15 @@ use bevy::prelude::*;
 use bevy_voxel_world::prelude::*;
 use doom_voxelize::Voxel;
 
-use crate::actors::{spawn_effect, DamageQueue, Hit, Noise, Rng, Shot, ShotEnd, Who};
+use crate::actors::{
+    spawn_effect, spawn_missile, Actor, DamageQueue, Hit, Noise, Rng, Shot, ShotEnd, Who,
+};
 use crate::camera::FlyCamera;
 use crate::capture::{CaptureSet, WorldSettled};
 use crate::debris::SprayDebris;
-use crate::info;
+use crate::info::{self, weapon_info, MissileInfo, WAction, WFrame};
 use crate::input::Intent;
+use crate::inventory::{Inventory, WeaponKind};
 use crate::movers::MoverSolids;
 use crate::player::Player;
 use crate::sound::PlaySound;
@@ -45,6 +62,13 @@ use crate::world::{material, DoomWorld, EditedChunks, GameMap, WorldSolid};
 
 /// DOOM's chaingun: a shot every 4 tics at 35 tics a second.
 pub const SHOT_INTERVAL: f32 = 4.0 / 35.0;
+/// p_pspr.c: the weapon's height on DOOM's 320×200 screen in hand and out
+/// of sight, and how far it moves a tic raising and lowering.
+pub const WEAPON_TOP: f32 = 32.0;
+const WEAPON_BOTTOM: f32 = 128.0;
+const RAISE_SPEED: f32 = 6.0;
+/// p_local.h `MELEERANGE` and `MISSILERANGE`, in units.
+const MELEE_RANGE: f32 = 64.0;
 /// Scorched voxels lie this far past the carved radius, in voxels.
 const SCORCH_DEPTH: f32 = 1.5;
 /// COLORMAP tables darker at the scorch's inner and outer edge.
@@ -59,7 +83,7 @@ const GOLDEN_ANGLE: f32 = 2.399_963;
 const SPREAD_FALLBACK_DISTANCE: f32 = 100.0;
 
 pub struct WeaponPlugin {
-    /// The carved ball's radius in voxels.
+    /// A bullet's carved ball radius in voxels; other weapons scale it.
     pub radius: i32,
     /// How far a shot reaches, in voxels.
     pub range: f32,
@@ -69,7 +93,32 @@ pub struct WeaponPlugin {
     pub flash_time: f32,
 }
 
-/// The gun's state, which the HUD draws.
+/// Where the weapon sprite is in its states: p_pspr.c's `ps_weapon`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Psp {
+    /// A_Raise, each tic until it is up.
+    Raising,
+    /// A_Lower, each tic until it is down.
+    Lowering,
+    /// Frame `frame` of the weapon's ready or attack frames, with tics left.
+    Ready {
+        frame: usize,
+        tics: i32,
+    },
+    Attack {
+        frame: usize,
+        tics: i32,
+    },
+}
+
+/// A weapon switch asked for: a number key, or wheel steps.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Slot(u8),
+    Step(i32),
+}
+
+/// The weapon in hand's state, which the HUD draws.
 #[derive(Resource)]
 pub struct Weapon {
     radius: i32,
@@ -81,13 +130,43 @@ pub struct Weapon {
     /// Since the last shot whose light hasn't landed: when it fired, frames
     /// since, and the longest frame since, in seconds.
     landing: Option<(Instant, u32, f32)>,
-    /// Seconds until the next shot may fire.
-    cooldown: f32,
-    /// Shots fired, and seconds since the last.
-    pub shots: u32,
-    pub since_shot: f32,
-    /// Shots in the current burst.
-    burst: u32,
+    psp: Psp,
+    /// The weapon's height on DOOM's 320×200 screen: `WEAPON_TOP` in hand.
+    pub sy: f32,
+    /// The muzzle flash showing: its frames, the frame, and tics left.
+    flash: Option<(&'static [WFrame], usize, i32)>,
+    /// Shots fired holding the trigger since the first: the pistol and
+    /// chaingun spread from the second on.
+    refire: u32,
+    /// The trigger was held at the last ready frame: the rocket launcher
+    /// and BFG don't fire on a trigger held from before they came up.
+    attack_down: bool,
+    /// A switch asked for since the last tic.
+    wanted: Option<Change>,
+}
+
+impl Weapon {
+    /// The sprite, frame letter and full-brightness of the weapon in hand.
+    pub fn frame(&self, inventory: &Inventory) -> (&'static str, u8, bool) {
+        let info = weapon_info(inventory.ready);
+        let frame = match self.psp {
+            Psp::Raising | Psp::Lowering => info.ready[0],
+            Psp::Ready { frame, .. } => info.ready[frame],
+            Psp::Attack { frame, .. } => info.attack[frame],
+        };
+        (info.sprite, frame.letter, frame.bright)
+    }
+
+    /// The muzzle flash's sprite and frame letter, while it shows.
+    pub fn flash_frame(&self, inventory: &Inventory) -> Option<(&'static str, u8)> {
+        let (frames, i, _) = self.flash?;
+        Some((weapon_info(inventory.ready).flash_sprite, frames[i].letter))
+    }
+
+    /// Whether it waits to fire, so it bobs as the player walks.
+    pub fn bobbing(&self) -> bool {
+        matches!(self.psp, Psp::Ready { .. })
+    }
 }
 
 #[derive(Resource)]
@@ -106,12 +185,22 @@ impl Plugin for WeaponPlugin {
             flash_time: self.flash_time,
             flashes: Vec::new(),
             landing: None,
-            cooldown: 0.0,
-            shots: 0,
-            since_shot: f32::INFINITY,
-            burst: 0,
+            // P_SetupPsprites: the weapon comes up as the map starts.
+            psp: Psp::Raising,
+            sy: WEAPON_BOTTOM,
+            flash: None,
+            refire: 0,
+            attack_down: false,
+            wanted: None,
         })
-        .add_systems(Update, fire_trigger.after(crate::player::walk))
+        .add_systems(
+            Startup,
+            drop_missing_weapons
+                .after(crate::camera::spawn_camera)
+                .after(crate::sprites::setup_sprites),
+        )
+        .add_systems(Update, ask_for_switch.after(crate::player::walk))
+        .add_systems(FixedUpdate, tic_weapon)
         .add_systems(Update, put_out_flashes)
         .add_systems(Last, report_landing);
         if self.scripted_shots > 0 {
@@ -215,118 +304,491 @@ impl Carver<'_, '_> {
     }
 }
 
-/// Fires while the trigger is held, at the chaingun's rate.
-#[allow(clippy::too_many_arguments)]
-fn fire_trigger(
-    mut commands: Commands,
-    time: Res<Time>,
-    intent: Res<Intent>,
-    camera: Single<(&Transform, &Player), With<FlyCamera>>,
-    mut weapon: ResMut<Weapon>,
-    mut carver: Carver,
-    mut gun: Gun,
-) {
-    let (transform, player) = camera.into_inner();
-    weapon.since_shot += time.delta_secs();
-    if weapon.cooldown > 0.0 {
-        weapon.cooldown -= time.delta_secs();
-    }
-    if !intent.fire || !player.alive() {
-        weapon.cooldown = weapon.cooldown.max(0.0);
-        weapon.burst = 0;
-        return;
-    }
-    if weapon.cooldown <= 0.0 {
-        weapon.cooldown += SHOT_INTERVAL;
-        let mut forward = *transform.forward();
-        if weapon.burst > 0 {
-            // DOOM's refire: (P_Random() − P_Random()) << 18 off the aim.
-            let off = gun.rng.spread() as f32 * (1u64 << 18) as f32 / 4_294_967_296.0
-                * std::f32::consts::TAU;
-            forward = Quat::from_rotation_y(off) * forward;
+/// Takes away the weapons the WAD has no sprites for, such as the super
+/// shotgun in DOOM, so `--weapons all` gives what the WAD can show.
+fn drop_missing_weapons(bank: Res<SpriteBank>, mut player: Single<&mut Player>) {
+    for w in WeaponKind::ALL {
+        if player.inventory.has(w) && !bank.has(weapon_info(w).sprite, b'A') {
+            println!(
+                "this WAD has no {} sprites: no {}",
+                weapon_info(w).sprite,
+                w.name()
+            );
+            player.inventory.remove(w);
         }
-        weapon.burst += 1;
-        let ray = Ray3d::new(
-            transform.translation,
-            Dir3::new(forward).unwrap_or(Dir3::NEG_Z),
-        );
-        player_shot(&mut commands, &mut carver, &mut weapon, &mut gun, ray);
     }
 }
 
-/// What a player's shot touches besides the world.
+/// Keeps the number key or wheel step of this frame for the next tic.
+fn ask_for_switch(intent: Res<Intent>, mut weapon: ResMut<Weapon>) {
+    if let Some(slot) = intent.weapon_slot {
+        weapon.wanted = Some(Change::Slot(slot));
+    } else if intent.weapon_step != 0 {
+        let steps = match weapon.wanted {
+            Some(Change::Step(n)) => n + intent.weapon_step,
+            _ => intent.weapon_step,
+        };
+        weapon.wanted = Some(Change::Step(steps));
+    }
+}
+
+/// Runs the weapon one tic: p_user.c `P_PlayerThink`'s switch, then
+/// p_pspr.c `P_MovePsprites`.
+fn tic_weapon(
+    intent: Res<Intent>,
+    mut weapon: ResMut<Weapon>,
+    camera: Single<(&Transform, &mut Player), With<FlyCamera>>,
+    mut arms: Arms,
+) {
+    let (transform, mut player) = camera.into_inner();
+    if let Some(change) = weapon.wanted.take() {
+        let inventory = &mut player.inventory;
+        let to = match change {
+            Change::Slot(slot) => inventory.for_slot(slot),
+            Change::Step(steps) => inventory.stepped(steps),
+        };
+        if to.is_some() {
+            inventory.pending = to;
+        }
+    }
+    let mut hand = Hand {
+        weapon: &mut weapon,
+        arms: &mut arms,
+        player: &mut player,
+        eye: transform.translation,
+        rotation: transform.rotation,
+        fire: intent.fire,
+    };
+    hand.tic();
+}
+
+/// What the weapon touches besides the world.
 #[derive(SystemParam)]
-pub struct Gun<'w, 's> {
+pub struct Arms<'w, 's> {
+    commands: Commands<'w, 's>,
+    carver: Carver<'w, 's>,
     rng: ResMut<'w, Rng>,
     queue: ResMut<'w, DamageQueue>,
     noise: ResMut<'w, Noise>,
     sounds: MessageWriter<'w, PlaySound>,
     bank: Res<'w, SpriteBank>,
     map: Res<'w, GameMap>,
-    player: Single<'w, 's, &'static Player>,
-    actors: Query<'w, 's, (Entity, &'static crate::actors::Actor)>,
+    actors: Query<'w, 's, (Entity, &'static Actor)>,
 }
 
-/// Fires one shot along `ray`: hurts the first thing it crosses, or carves
-/// the world. Returns the voxel it carved around.
-fn player_shot(
-    commands: &mut Commands,
-    carver: &mut Carver,
-    weapon: &mut Weapon,
-    gun: &mut Gun,
-    ray: Ray3d,
-) -> Option<IVec3> {
-    weapon.shots += 1;
-    weapon.since_shot = 0.0;
-    gun.sounds.write(PlaySound::global("PISTOL"));
-    gun.noise.0 = Some(ray.origin);
-    let targets: Vec<_> = gun
-        .actors
-        .iter()
-        .filter(|(_, a)| a.shootable)
-        .map(|(e, a)| (e, a.feet, a.radius, a.height, a.info))
-        .collect();
-    let world = carver.solid();
-    let shot = Shot {
-        origin: ray.origin,
-        dir: *ray.direction,
-        range: weapon.range,
-        source: Who::Player,
-    };
-    match shot.fire(&world, &gun.player, &targets) {
-        ShotEnd::Thing(target, at) => {
-            let amount = 5 * (gun.rng.next() % 3 + 1);
-            gun.queue.0.push(Hit {
-                target,
-                amount,
-                source: Who::Player,
-                from: ray.origin,
-            });
-            let barrel = matches!(target, Who::Actor(e) if gun.actors.get(e).is_ok_and(|(_, a)| a.info.inert));
-            let (sprite, frames) = if barrel {
-                ("PUFF", info::PUFF)
-            } else {
-                ("BLUD", info::BLOOD)
+/// The weapon in the player's hand for one tic.
+struct Hand<'a, 'w, 's> {
+    weapon: &'a mut Weapon,
+    arms: &'a mut Arms<'w, 's>,
+    player: &'a mut Player,
+    /// The camera: shots start at its position and go along its view.
+    eye: Vec3,
+    rotation: Quat,
+    /// The trigger is held.
+    fire: bool,
+}
+
+/// What a hitscan struck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Struck {
+    Thing,
+    World,
+    Nothing,
+}
+
+impl Hand<'_, '_, '_> {
+    fn tic(&mut self) {
+        // P_DropWeapon: down it goes on death, and comes back up on respawn.
+        if !self.player.alive() && self.weapon.psp != Psp::Lowering {
+            self.weapon.flash = None;
+            self.set(Psp::Lowering);
+            return;
+        }
+        match self.weapon.psp {
+            psp @ (Psp::Raising | Psp::Lowering) => self.set(psp),
+            Psp::Ready { frame, tics } | Psp::Attack { frame, tics } if tics > 0 => {
+                let left = tics - 1;
+                let psp = match self.weapon.psp {
+                    Psp::Ready { .. } => Psp::Ready { frame, tics: left },
+                    _ => Psp::Attack { frame, tics: left },
+                };
+                self.weapon.psp = psp;
+                if left == 0 {
+                    let next = self.next(psp);
+                    self.set(next);
+                }
+            }
+            _ => {}
+        }
+        if let Some((frames, i, tics)) = &mut self.weapon.flash {
+            *tics -= 1;
+            if *tics <= 0 {
+                *i += 1;
+                match frames.get(*i) {
+                    Some(f) => *tics = f.tics,
+                    None => self.weapon.flash = None,
+                }
+            }
+        }
+    }
+
+    fn ready_weapon(&self) -> WeaponKind {
+        self.player.inventory.ready
+    }
+
+    /// The frame after `psp`: ready frames loop, attack frames end in ready.
+    fn next(&self, psp: Psp) -> Psp {
+        let info = weapon_info(self.ready_weapon());
+        match psp {
+            Psp::Ready { frame, .. } => Psp::Ready {
+                frame: (frame + 1) % info.ready.len(),
+                tics: 0,
+            },
+            Psp::Attack { frame, .. } if frame + 1 < info.attack.len() => Psp::Attack {
+                frame: frame + 1,
+                tics: 0,
+            },
+            _ => Psp::Ready { frame: 0, tics: 0 },
+        }
+    }
+
+    /// p_pspr.c `P_SetPsprite`: enters `to` and runs actions, on through
+    /// frames of no tics and the jumps actions make.
+    fn set(&mut self, mut to: Psp) {
+        for _ in 0..16 {
+            let info = weapon_info(self.ready_weapon());
+            let jump = match to {
+                Psp::Raising => {
+                    self.weapon.psp = to;
+                    self.raise()
+                }
+                Psp::Lowering => {
+                    self.weapon.psp = to;
+                    self.lower()
+                }
+                Psp::Ready { frame, .. } => {
+                    let f = info.ready[frame];
+                    self.weapon.psp = Psp::Ready {
+                        frame,
+                        tics: f.tics,
+                    };
+                    self.act(f.action, frame)
+                }
+                Psp::Attack { frame, .. } => {
+                    let f = info.attack[frame];
+                    self.weapon.psp = Psp::Attack {
+                        frame,
+                        tics: f.tics,
+                    };
+                    self.act(f.action, frame)
+                }
             };
-            spawn_effect(commands, &gun.bank, sprite, frames, at, 0.0);
-            None
+            to = match (jump, self.weapon.psp) {
+                (Some(next), _) => next,
+                (
+                    None,
+                    psp @ (Psp::Ready { tics: 0, .. } | Psp::Attack { tics: 0, .. }),
+                ) => self.next(psp),
+                _ => return,
+            };
         }
-        ShotEnd::World(hit, at) => {
-            weapon.landing = Some((Instant::now(), 0, 0.0));
-            let centre = hit.voxel;
-            carver.carve(centre, Some(hit.normal), weapon.radius);
-            spawn_effect(
-                commands,
-                &gun.bank,
-                "PUFF",
-                info::PUFF,
-                at,
-                0.5 / gun.map.units,
-            );
-            light_flash(carver, weapon, &gun.map, centre + hit.normal);
-            Some(centre)
+    }
+
+    /// A_Raise.
+    fn raise(&mut self) -> Option<Psp> {
+        self.weapon.sy -= RAISE_SPEED;
+        if self.weapon.sy > WEAPON_TOP {
+            return None;
         }
-        ShotEnd::Nothing => None,
+        self.weapon.sy = WEAPON_TOP;
+        Some(Psp::Ready { frame: 0, tics: 0 })
+    }
+
+    /// A_Lower: once down, the pending weapon comes up, unless the player
+    /// is dead (P_BringUpWeapon).
+    fn lower(&mut self) -> Option<Psp> {
+        self.weapon.sy += RAISE_SPEED;
+        if self.weapon.sy < WEAPON_BOTTOM {
+            return None;
+        }
+        self.weapon.sy = WEAPON_BOTTOM;
+        if !self.player.alive() {
+            return None;
+        }
+        let inventory = &mut self.player.inventory;
+        inventory.ready = inventory.pending.take().unwrap_or(inventory.ready);
+        if inventory.ready == WeaponKind::Chainsaw {
+            self.sound("SAWUP");
+        }
+        Some(Psp::Raising)
+    }
+
+    /// p_pspr.c `P_CheckAmmo`: whether the weapon in hand can fire; if not,
+    /// the best one left is pending and this one lowers.
+    fn check_ammo(&mut self) -> bool {
+        let inventory = &mut self.player.inventory;
+        if inventory.can_fire(inventory.ready) {
+            return true;
+        }
+        inventory.pending = Some(inventory.best_with_ammo());
+        false
+    }
+
+    /// p_pspr.c `P_FireWeapon`.
+    fn fire_weapon(&mut self) -> Option<Psp> {
+        if !self.check_ammo() {
+            return Some(Psp::Lowering);
+        }
+        self.arms.noise.0 = Some(self.eye);
+        Some(Psp::Attack { frame: 0, tics: 0 })
+    }
+
+    /// A_ReFire.
+    fn refire(&mut self) -> Option<Psp> {
+        if self.fire && self.player.inventory.pending.is_none() && self.player.alive() {
+            self.weapon.refire += 1;
+            return self.fire_weapon();
+        }
+        self.weapon.refire = 0;
+        (!self.check_ammo()).then_some(Psp::Lowering)
+    }
+
+    /// The action of a frame, `frame` of its sequence: where it jumps.
+    fn act(&mut self, action: WAction, frame: usize) -> Option<Psp> {
+        let weapon = self.ready_weapon();
+        match action {
+            WAction::None => {}
+            WAction::Ready => {
+                if self.player.inventory.pending.is_some() || !self.player.alive() {
+                    return Some(Psp::Lowering);
+                }
+                if weapon == WeaponKind::Chainsaw && frame == 0 {
+                    self.sound("SAWIDL");
+                }
+                if self.fire {
+                    let held = matches!(weapon, WeaponKind::Missile | WeaponKind::Bfg);
+                    if !self.weapon.attack_down || !held {
+                        self.weapon.attack_down = true;
+                        return self.fire_weapon();
+                    }
+                } else {
+                    self.weapon.attack_down = false;
+                }
+            }
+            WAction::ReFire => return self.refire(),
+            WAction::GunFlash => self.start_flash(0),
+            WAction::Punch => {
+                let mut damage = (self.arms.rng.next() % 10 + 1) * 2;
+                let berserk = self.player.inventory.berserk;
+                if berserk {
+                    damage *= 10;
+                }
+                let yaw = self.spread(18);
+                let dir = self.turned(yaw, 0.0);
+                let carve = if berserk { self.half() } else { 1 };
+                let reach = MELEE_RANGE / self.arms.map.units;
+                if self.line_attack(dir, reach, damage, carve) == Struck::Thing {
+                    self.sound("PUNCH");
+                }
+            }
+            WAction::Saw => {
+                let damage = 2 * (self.arms.rng.next() % 10 + 1);
+                let yaw = self.spread(18);
+                let dir = self.turned(yaw, 0.0);
+                let reach = (MELEE_RANGE + 1.0) / self.arms.map.units;
+                let carve = self.half();
+                let struck = self.line_attack(dir, reach, damage, carve);
+                self.sound(if struck == Struck::Thing {
+                    "SAWHIT"
+                } else {
+                    "SAWFUL"
+                });
+            }
+            WAction::Pistol => {
+                self.sound("PISTOL");
+                self.player.inventory.use_ammo();
+                self.start_flash(0);
+                self.gun_shot(self.weapon.refire == 0, self.weapon.radius);
+            }
+            WAction::Shotgun => {
+                self.sound("SHOTGN");
+                self.player.inventory.use_ammo();
+                self.start_flash(0);
+                for _ in 0..7 {
+                    self.gun_shot(false, self.half());
+                }
+            }
+            WAction::SuperShotgun => {
+                self.sound("DSHTGN");
+                self.player.inventory.use_ammo();
+                self.start_flash(0);
+                for _ in 0..20 {
+                    let damage = 5 * (self.arms.rng.next() % 3 + 1);
+                    let yaw = self.spread(19);
+                    // (P_Random() − P_Random()) << 5 on the slope.
+                    let slope = self.arms.rng.spread() as f32 * 32.0 / 65536.0;
+                    let dir = self.turned(yaw, slope.atan());
+                    self.line_attack(dir, self.weapon.range, damage, self.half());
+                }
+            }
+            WAction::CheckReload => {
+                if !self.check_ammo() {
+                    return Some(Psp::Lowering);
+                }
+            }
+            WAction::OpenShotgun2 => self.sound("DBOPN"),
+            WAction::LoadShotgun2 => self.sound("DBLOAD"),
+            WAction::CloseShotgun2 => {
+                self.sound("DBCLS");
+                return self.refire();
+            }
+            WAction::ChainGun => {
+                if !self.player.inventory.can_fire(weapon) {
+                    return None;
+                }
+                self.sound("PISTOL");
+                self.player.inventory.use_ammo();
+                self.start_flash(frame);
+                self.gun_shot(self.weapon.refire == 0, self.weapon.radius);
+            }
+            WAction::Missile => {
+                self.player.inventory.use_ammo();
+                self.launch(&info::ROCKET, 2 * self.weapon.radius);
+            }
+            WAction::Plasma => {
+                self.player.inventory.use_ammo();
+                let which = (self.arms.rng.next() & 1) as usize;
+                self.start_flash(which);
+                let crater = (self.weapon.radius * 3 / 4).max(1);
+                self.launch(&info::PLASMA_BALL, crater);
+            }
+            WAction::BfgSound => self.sound("BFG"),
+            WAction::Bfg => {
+                self.player.inventory.use_ammo();
+                self.launch(&info::BFG_BALL, 4 * self.weapon.radius);
+            }
+        }
+        None
+    }
+
+    fn sound(&mut self, name: &'static str) {
+        self.arms.sounds.write(PlaySound::global(name));
+    }
+
+    /// Half the bullet's carve: a pellet's, the chainsaw's.
+    fn half(&self) -> i32 {
+        (self.weapon.radius / 2).max(1)
+    }
+
+    /// Starts muzzle flash `which` of the weapon in hand.
+    fn start_flash(&mut self, which: usize) {
+        let flashes = weapon_info(self.ready_weapon()).flashes;
+        if let Some(frames) = flashes.get(which).or(flashes.first()) {
+            self.weapon.flash = Some((frames, 0, frames[0].tics));
+        }
+    }
+
+    /// Radians of DOOM's `(P_Random() − P_Random()) << shift`.
+    fn spread(&mut self, shift: u32) -> f32 {
+        self.arms.rng.spread() as f32 * (1u64 << shift) as f32 / 4_294_967_296.0
+            * std::f32::consts::TAU
+    }
+
+    /// The view turned `yaw` radians left and `pitch` up.
+    fn turned(&self, yaw: f32, pitch: f32) -> Vec3 {
+        let forward = self.rotation * Vec3::NEG_Z;
+        let right = self.rotation * Vec3::X;
+        Quat::from_rotation_y(yaw) * (Quat::from_axis_angle(right, pitch) * forward)
+    }
+
+    /// p_pspr.c `P_GunShot`: a bullet for 5 × (1 to 3), along the view if
+    /// `accurate`, else spread, carving `carve` voxels.
+    fn gun_shot(&mut self, accurate: bool, carve: i32) {
+        let damage = 5 * (self.arms.rng.next() % 3 + 1);
+        let yaw = if accurate { 0.0 } else { self.spread(18) };
+        let dir = self.turned(yaw, 0.0);
+        self.line_attack(dir, self.weapon.range, damage, carve);
+    }
+
+    /// A hitscan from the eye along `dir` for `range` voxels: hurts the first
+    /// thing it crosses, or carves the world `carve` voxels round.
+    fn line_attack(&mut self, dir: Vec3, range: f32, damage: i32, carve: i32) -> Struck {
+        let origin = self.eye;
+        let arms = &mut *self.arms;
+        let targets: Vec<_> = arms
+            .actors
+            .iter()
+            .filter(|(_, a)| a.shootable)
+            .map(|(e, a)| (e, a.feet, a.radius, a.height, a.info))
+            .collect();
+        let world = arms.carver.solid();
+        let shot = Shot {
+            origin,
+            dir,
+            range,
+            source: Who::Player,
+        };
+        match shot.fire(&world, self.player, &targets) {
+            ShotEnd::Thing(target, at) => {
+                arms.queue.0.push(Hit {
+                    target,
+                    amount: damage,
+                    source: Who::Player,
+                    from: origin,
+                });
+                let barrel = matches!(target, Who::Actor(e) if arms.actors.get(e).is_ok_and(|(_, a)| a.info.inert));
+                let (sprite, frames) = if barrel {
+                    ("PUFF", info::PUFF)
+                } else {
+                    ("BLUD", info::BLOOD)
+                };
+                spawn_effect(&mut arms.commands, &arms.bank, sprite, frames, at, 0.0);
+                Struck::Thing
+            }
+            ShotEnd::World(hit, at) => {
+                self.weapon.landing = Some((Instant::now(), 0, 0.0));
+                arms.carver.carve(hit.voxel, Some(hit.normal), carve);
+                let rise = 0.5 / arms.map.units;
+                spawn_effect(
+                    &mut arms.commands,
+                    &arms.bank,
+                    "PUFF",
+                    info::PUFF,
+                    at,
+                    rise,
+                );
+                light_flash(
+                    &mut arms.carver,
+                    self.weapon,
+                    &arms.map,
+                    hit.voxel + hit.normal,
+                );
+                Struck::World
+            }
+            ShotEnd::Nothing => Struck::Nothing,
+        }
+    }
+
+    /// p_mobj.c `P_SpawnPlayerMissile`: a projectile from the eye along the
+    /// view, carving `crater` voxels where it bursts.
+    fn launch(&mut self, info: &'static MissileInfo, crater: i32) {
+        let s = self.arms.map.units;
+        let dir = self.rotation * Vec3::NEG_Z;
+        // A projectile's position is its bottom; its middle starts at the eye.
+        let pos = self.eye - Vec3::Y * 4.0 / s;
+        if !info.sound.is_empty() {
+            self.sound(info.sound);
+        }
+        spawn_missile(
+            &mut self.arms.commands,
+            &self.arms.bank,
+            info,
+            pos,
+            dir * info.speed / s,
+            Who::Player,
+            None,
+            crater,
+        );
     }
 }
 
@@ -374,19 +836,18 @@ fn put_out_flashes(
 /// Fires the next scripted shot once the world has settled, one a frame,
 /// and holds the screenshot back until the carved chunks have remeshed.
 fn fire_scripted(
-    mut commands: Commands,
     mut shots: ResMut<ScriptedShots>,
     mut settled: ResMut<WorldSettled>,
-    camera: Single<&Transform, With<FlyCamera>>,
+    camera: Single<(&Transform, &mut Player), With<FlyCamera>>,
     mut weapon: ResMut<Weapon>,
-    mut carver: Carver,
-    mut gun: Gun,
+    mut arms: Arms,
 ) {
     if shots.fired >= shots.total || (shots.fired == 0 && !settled.is_settled()) {
         return;
     }
+    let (camera, mut player) = camera.into_inner();
     if shots.fired == 0 {
-        let world = carver.solid();
+        let world = arms.carver.solid();
         let distance = crate::collide::trace(
             &world,
             camera.translation,
@@ -400,11 +861,22 @@ fn fire_scripted(
     let off = shots.spread * (i as f32).sqrt();
     let turn = GOLDEN_ANGLE * i as f32;
     let aim = Quat::from_euler(EulerRot::YXZ, off * turn.cos(), off * turn.sin(), 0.0);
-    let direction = Dir3::new(camera.rotation * aim * Vec3::NEG_Z).unwrap_or(Dir3::NEG_Z);
-    let ray = Ray3d::new(camera.translation, direction);
-    match player_shot(&mut commands, &mut carver, &mut weapon, &mut gun, ray) {
-        Some(hit) => println!("shot {}: hit voxel {hit}", i + 1),
-        None => println!("shot {}: hit a thing or nothing", i + 1),
+    let mut hand = Hand {
+        weapon: &mut weapon,
+        arms: &mut arms,
+        player: &mut player,
+        eye: camera.translation,
+        rotation: camera.rotation * aim,
+        fire: false,
+    };
+    hand.sound("PISTOL");
+    hand.arms.noise.0 = Some(camera.translation);
+    let damage = 5 * (hand.arms.rng.next() % 3 + 1);
+    let (range, radius) = (hand.weapon.range, hand.weapon.radius);
+    let dir = hand.turned(0.0, 0.0);
+    match hand.line_attack(dir, range, damage, radius) {
+        Struck::World => println!("shot {}: hit the world", i + 1),
+        _ => println!("shot {}: hit a thing or nothing", i + 1),
     }
     shots.fired += 1;
     settled.unsettle();

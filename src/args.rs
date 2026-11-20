@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use doom_voxelize::LampLevel;
 
+use crate::inventory::{AmmoKind, Inventory, WeaponKind};
+
 pub const USAGE: &str = "\
 doom_voxels: a vanilla DOOM map as a bevy_voxel_world voxel world
 
@@ -42,6 +44,13 @@ usage: doom_voxels --wad PATH [options]
   --god                   take no damage
   --health N              start with N health, 1 to 200 (default 100); an exit switch starts
                           the next map with the health you left with
+  --weapons LIST          start with these weapons besides the fist and pistol, comma-separated:
+                          chainsaw shotgun ssg chaingun rocket plasma bfg, or all
+  --ammo B,S,R,C          start with this many bullets, shells, rockets and cells, or full
+                          (default 50,0,0,0)
+  --backpack              start with the backpack: twice the ammo
+  --weapon NAME           start with this weapon in hand
+                          (an exit switch carries weapons, ammo and the backpack on)
   --freeze                things stand still and don't think, for screenshots
   --frame-times           print frame time statistics every 5 seconds
   --mute                  no sound
@@ -49,12 +58,13 @@ usage: doom_voxels --wad PATH [options]
   --awake                 monsters start awake, chasing the player
   --script STEPS          play a script once the world has settled: comma-separated steps
                           w:S s:S a:S d:S (walk S seconds; capitals run), jw:S (jump while
-                          walking), jump, use, turn:DEG, pitch:DEG, fire:N, wait:S, shot:PATH,
-                          respawn
+                          walking), jump, use, turn:DEG, pitch:DEG, fire:N, weapon:N, wait:S,
+                          shot:PATH, respawn
   --pos X,Y,Z             start the camera here, in voxel coordinates
   --yaw DEG               start yaw, 0 facing DOOM's north, positive turning left
   --pitch DEG             start pitch, positive looking up
-  --blast-radius R        the weapon's carved ball radius in voxels (default 4)
+  --blast-radius R        a bullet's carved ball radius in voxels (default 4); other weapons
+                          carve in proportion
   --fire N                fire N shots around the view centre once the world is ready
   --debris N              debris cubes a shot throws out (default 16, 0 for none);
                           smaller carves throw fewer, barrels more
@@ -94,7 +104,16 @@ pub struct Args {
     pub frame_times: bool,
     pub mute: bool,
     pub health: i32,
+    /// What the player starts with.
+    pub inventory: Inventory,
     pub script: Option<Vec<crate::input::Step>>,
+}
+
+/// `--ammo`: counts, or full.
+#[derive(Clone, Copy, Debug)]
+enum AmmoArg {
+    Counts([i32; 4]),
+    Full,
 }
 
 /// How the map is lit.
@@ -271,8 +290,13 @@ fn parse_from(
         frame_times: false,
         mute: false,
         health: 100,
+        inventory: Inventory::default(),
         script: None,
     };
+    let mut weapons: Vec<WeaponKind> = Vec::new();
+    let mut ammo = None;
+    let mut backpack = false;
+    let mut in_hand = None;
     let mut words = words.into_iter();
     while let Some(word) = words.next() {
         match word.as_str() {
@@ -288,6 +312,7 @@ fn parse_from(
             "--freeze" => args.freeze = true,
             "--frame-times" => args.frame_times = true,
             "--mute" => args.mute = true,
+            "--backpack" => backpack = true,
             _ => {
                 let value = words
                     .next()
@@ -415,6 +440,13 @@ fn parse_from(
                             .filter(|n: &i32| (1..=200).contains(n))
                             .ok_or_else(|| format!("{word} needs a whole number from 1 to 200"))?
                     }
+                    "--weapons" => weapons.extend(parse_weapons(&value)?),
+                    "--ammo" => ammo = Some(parse_ammo(&value)?),
+                    "--weapon" => {
+                        in_hand = Some(WeaponKind::parse(&value).ok_or_else(|| {
+                            format!("{word} needs a weapon name, not {value:?}")
+                        })?)
+                    }
                     "--script" => args.script = Some(crate::input::parse_script(&value)?),
                     "--pos" => args.pos = Some(parse_vec3(&value)?),
                     "--yaw" => args.yaw = Some(number("degrees")?),
@@ -428,6 +460,7 @@ fn parse_from(
             }
         }
     }
+    args.inventory = starting_inventory(&weapons, ammo, backpack, in_hand);
     args.wad = wad.or_else(|| wad_env.map(PathBuf::from)).ok_or_else(|| {
         "no WAD file: pass --wad PATH or set the DOOM_WAD environment variable"
             .to_string()
@@ -450,6 +483,7 @@ const SWITCHES: &[&str] = &[
     "--freeze",
     "--frame-times",
     "--mute",
+    "--backpack",
 ];
 
 /// The flags that belong to the first map's run and don't carry on to the
@@ -464,20 +498,30 @@ const FIRST_MAP_ONLY: &[&str] = &[
     "--fire",
     "--screenshot",
     "--screenshot-delay",
+    "--weapons",
+    "--ammo",
+    "--weapon",
 ];
 
-/// The command line `words` for the next map: `map` with `health`, and the
-/// other settings as they were.
+/// The switches that belong to the first map's run: the next map gets
+/// them from what the player carries.
+const FIRST_MAP_SWITCHES: &[&str] = &["--backpack"];
+
+/// The command line `words` for the next map: `map` with `health` and
+/// `inventory`, and the other settings as they were.
 pub fn next_level_words(
     words: impl IntoIterator<Item = String>,
     map: &str,
     health: i32,
+    inventory: &Inventory,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut words = words.into_iter();
     while let Some(word) = words.next() {
         if SWITCHES.contains(&word.as_str()) {
-            out.push(word);
+            if !FIRST_MAP_SWITCHES.contains(&word.as_str()) {
+                out.push(word);
+            }
             continue;
         }
         let value = words.next();
@@ -492,7 +536,90 @@ pub fn next_level_words(
         "--health".into(),
         health.to_string(),
     ]);
+    let extra: Vec<&str> = inventory
+        .weapons()
+        .filter(|w| !matches!(w, WeaponKind::Fist | WeaponKind::Pistol))
+        .map(WeaponKind::name)
+        .collect();
+    if !extra.is_empty() {
+        out.extend(["--weapons".into(), extra.join(",")]);
+    }
+    let counts: Vec<String> = AmmoKind::ALL
+        .iter()
+        .map(|&kind| inventory.ammo(kind).to_string())
+        .collect();
+    out.extend(["--ammo".into(), counts.join(",")]);
+    if inventory.backpack {
+        out.push("--backpack".into());
+    }
+    out.extend(["--weapon".into(), inventory.ready.name().into()]);
     out
+}
+
+/// `--weapons`: names, or all.
+fn parse_weapons(text: &str) -> Result<Vec<WeaponKind>, String> {
+    if text == "all" {
+        return Ok(WeaponKind::ALL.to_vec());
+    }
+    text.split(',')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            WeaponKind::parse(w).ok_or_else(|| {
+                format!(
+                    "--weapons doesn't know {w:?}: it takes all, or some of {}",
+                    WeaponKind::ALL.map(WeaponKind::name).join(" ")
+                )
+            })
+        })
+        .collect()
+}
+
+/// `--ammo`: B,S,R,C, or full.
+fn parse_ammo(text: &str) -> Result<AmmoArg, String> {
+    if text == "full" {
+        return Ok(AmmoArg::Full);
+    }
+    let counts: Vec<i32> = text
+        .split(',')
+        .map(|n| n.trim().parse::<i32>().ok().filter(|n| *n >= 0))
+        .collect::<Option<_>>()
+        .ok_or_else(|| {
+            format!("--ammo needs four counts B,S,R,C or full, not {text:?}")
+        })?;
+    match counts[..] {
+        [b, s, r, c] => Ok(AmmoArg::Counts([b, s, r, c])),
+        _ => Err(format!(
+            "--ammo needs four counts B,S,R,C or full, not {text:?}"
+        )),
+    }
+}
+
+/// The inventory the flags ask for: a pistol start with `weapons` added,
+/// `ammo` up to the limits, and `in_hand` in hand (and owned).
+fn starting_inventory(
+    weapons: &[WeaponKind],
+    ammo: Option<AmmoArg>,
+    backpack: bool,
+    in_hand: Option<WeaponKind>,
+) -> Inventory {
+    let mut inventory = Inventory::default();
+    inventory.backpack = backpack;
+    for &w in weapons.iter().chain(&in_hand) {
+        inventory.add(w);
+    }
+    for (i, kind) in AmmoKind::ALL.into_iter().enumerate() {
+        let amount = match ammo {
+            Some(AmmoArg::Counts(counts)) => counts[i],
+            Some(AmmoArg::Full) => inventory.max(kind),
+            None => inventory.ammo(kind),
+        };
+        inventory.set_ammo(kind, amount);
+    }
+    if let Some(w) = in_hand {
+        inventory.ready = w;
+    }
+    inventory
 }
 
 fn parse_vec3(text: &str) -> Result<Vec3, String> {
@@ -691,12 +818,13 @@ mod tests {
             .filter(|w| !w.is_empty()),
             "E1M2",
             73,
+            &Inventory::default(),
         );
         assert_eq!(
             next,
             words(
                 "--wad a.wad --god --light propagated --mute --quit-after 9 \
-                 --map E1M2 --health 73"
+                 --map E1M2 --health 73 --ammo 50,0,0,0 --weapon pistol"
             )
             .into_iter()
             .filter(|w| !w.is_empty())
@@ -712,5 +840,58 @@ mod tests {
             assert!(parse(&[switch], Some("a.wad")).is_ok(), "{switch}");
         }
         assert!(parse(&["--health", "0"], Some("a.wad")).is_err());
+    }
+
+    #[test]
+    fn the_inventory_flags_and_carrying_it_on() {
+        let args = parse(&[], Some("a.wad")).unwrap();
+        assert_eq!(args.inventory, Inventory::default());
+        let args = parse(
+            &[
+                "--weapons",
+                "shotgun,rocket",
+                "--ammo",
+                "300,10,2,0",
+                "--weapon",
+                "rocket",
+            ],
+            Some("a.wad"),
+        )
+        .unwrap();
+        let inv = args.inventory;
+        assert!(inv.has(WeaponKind::Shotgun) && inv.has(WeaponKind::Missile));
+        assert!(!inv.has(WeaponKind::Bfg));
+        assert_eq!(inv.ammo(AmmoKind::Bullets), 200, "clamped to the limit");
+        assert_eq!(inv.ready, WeaponKind::Missile);
+        let args = parse(
+            &["--weapons", "all", "--ammo", "full", "--backpack"],
+            Some("a.wad"),
+        )
+        .unwrap();
+        assert!(WeaponKind::ALL.iter().all(|w| args.inventory.has(*w)));
+        assert_eq!(args.inventory.ammo(AmmoKind::Cells), 600);
+        assert!(parse(&["--weapons", "railgun"], Some("a.wad")).is_err());
+        assert!(parse(&["--ammo", "1,2,3"], Some("a.wad")).is_err());
+
+        // Carried on: weapons, ammo, backpack and weapon in hand, once.
+        let next = next_level_words(
+            [
+                "--wad",
+                "a.wad",
+                "--backpack",
+                "--weapons",
+                "bfg",
+                "--ammo",
+                "full",
+            ]
+            .map(String::from),
+            "E1M2",
+            100,
+            &args.inventory,
+        );
+        assert_eq!(next.iter().filter(|w| *w == "--backpack").count(), 1);
+        let again =
+            parse(&next.iter().map(String::as_str).collect::<Vec<_>>(), None).unwrap();
+        assert_eq!(again.inventory, args.inventory.next_map());
     }
 }

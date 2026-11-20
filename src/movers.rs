@@ -21,6 +21,8 @@
 //! Space uses the line in front of the player within DOOM's 64 units, as
 //! p_map.c `P_UseLines` does: manual doors, and switches, which flip
 //! between their `SW1` and `SW2` textures by editing the world's voxels.
+//! A keyed door or switch does nothing without a key of its colour, but
+//! says which it needs.
 
 use std::sync::Arc;
 
@@ -30,6 +32,7 @@ use doom_voxelize::{height_row, VoxelMap};
 use doom_wad::MapData;
 
 use crate::actors::Actor;
+use crate::hud::HudMessage;
 use crate::input::Intent;
 use crate::levels::LevelExit;
 use crate::player::{Mode, Player};
@@ -727,6 +730,7 @@ fn use_lines(
     mut voxel_world: VoxelWorld<DoomWorld>,
     mut sounds: MessageWriter<PlaySound>,
     mut exits: MessageWriter<LevelExit>,
+    mut message: ResMut<HudMessage>,
     sectors: Res<SectorHeights>,
 ) {
     let (player, fly) = *player;
@@ -751,6 +755,16 @@ fn use_lines(
         let on_back = (l.b - l.a).perp_dot(from - l.a) > 0.0;
         if let Some(use_) = movers.specials.lines.get(&line).copied() {
             if on_back {
+                return;
+            }
+            if let Some(colour) = use_.key.filter(|c| !player.inventory.has_key(*c)) {
+                let what = if use_.manual {
+                    "open this door"
+                } else {
+                    "activate this object"
+                };
+                message.say(format!("You need a {} key to {what}", colour.name()));
+                sounds.write(PlaySound::global("OOF"));
                 return;
             }
             if movers.activate(line, use_, back, &mut sounds, s) {

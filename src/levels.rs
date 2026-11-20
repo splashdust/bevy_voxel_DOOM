@@ -1,17 +1,20 @@
 //! Moving on from a map: an exit switch picks the next map as DOOM does
-//! (g_game.c `G_DoCompleted`), and the game starts it with the health the
-//! player left with.
+//! (g_game.c `G_DoCompleted`), and the game starts it with the health,
+//! weapons, ammo and backpack the player left with. Keys and berserk stay
+//! behind, as `G_PlayerFinishLevel` clears them.
 //!
 //! The world, its sub-grids, the monsters and the light are all built for
 //! one map at startup, so the next map starts as a fresh run of this
 //! program: the app exits a second after the switch, once its sound has
 //! played, and `main` starts the program again in its place with `--map`
-//! and `--health` set (see [`relaunch`]).
+//! `--health`, `--weapons`, `--ammo`, `--backpack` and `--weapon` set (see
+//! [`relaunch`]).
 
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 
+use crate::inventory::Inventory;
 use crate::player::Player;
 
 /// Seconds between the exit switch and leaving the map.
@@ -23,10 +26,18 @@ pub struct LevelExit {
     pub secret: bool,
 }
 
-/// The map to start once the app has exited, and the player's health,
-/// shared with `main`.
+/// The map to start once the app has exited, with what the player takes
+/// there, shared with `main`.
 #[derive(Resource, Clone, Default)]
-pub struct NextLevel(pub Arc<Mutex<Option<(String, i32)>>>);
+pub struct NextLevel(pub Arc<Mutex<Option<Carried>>>);
+
+/// What the player takes to the next map.
+#[derive(Clone, Debug)]
+pub struct Carried {
+    pub map: String,
+    pub health: i32,
+    pub inventory: Inventory,
+}
 
 pub struct LevelsPlugin {
     pub map: String,
@@ -67,8 +78,11 @@ fn leave_level(
     if let Some((to, since)) = &mut maps.leaving {
         *since += time.delta_secs();
         if *since >= EXIT_DELAY {
-            *next.0.lock().expect("nothing panics holding it") =
-                Some((to.clone(), player.health));
+            *next.0.lock().expect("nothing panics holding it") = Some(Carried {
+                map: to.clone(),
+                health: player.health,
+                inventory: player.inventory.next_map(),
+            });
             app_exit.write(AppExit::Success);
         }
         exits.clear();
@@ -137,11 +151,18 @@ fn episode_map(map: &str) -> Option<(u32, u32)> {
     Some((e.parse().ok()?, m.parse().ok()?))
 }
 
-/// Starts this program again for `map` with `health`, keeping the command
-/// line's other settings: see [`crate::args::next_level_words`]. On Unix the
-/// new run replaces this process.
-pub fn relaunch(map: &str, health: i32) -> AppExit {
-    let words = crate::args::next_level_words(std::env::args().skip(1), map, health);
+/// Starts this program again for the next map with what the player
+/// carries, keeping the command line's other settings: see
+/// [`crate::args::next_level_words`]. On Unix the new run replaces this
+/// process.
+pub fn relaunch(carried: &Carried) -> AppExit {
+    let (map, health) = (carried.map.as_str(), carried.health);
+    let words = crate::args::next_level_words(
+        std::env::args().skip(1),
+        map,
+        health,
+        &carried.inventory,
+    );
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {

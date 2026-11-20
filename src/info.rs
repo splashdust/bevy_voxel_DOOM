@@ -55,6 +55,8 @@ pub enum Action {
 
 use Action::*;
 
+use crate::inventory::{AmmoKind, Key, Pickup, WeaponKind};
+
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     /// The frame letter, `b'A'` first.
@@ -899,6 +901,11 @@ pub struct MissileInfo {
     pub homing: bool,
     pub sound: &'static str,
     pub burst_sound: &'static str,
+    /// p_map.c `P_RadiusAttack` damage at its burst, in units: the rocket's
+    /// 128, or 0 for none.
+    pub blast: f32,
+    /// The BFG ball: its burst sprays 40 tracers from the player.
+    pub spray: bool,
 }
 
 const BALL_BURST: [Frame; 3] = [b(b'C', 6, Idle), b(b'D', 6, Idle), b(b'E', 6, Idle)];
@@ -914,6 +921,8 @@ pub const IMP_BALL: MissileInfo = MissileInfo {
     homing: false,
     sound: "FIRSHT",
     burst_sound: "FIRXPL",
+    blast: 0.0,
+    spray: false,
 };
 
 pub const CACO_BALL: MissileInfo = MissileInfo {
@@ -942,6 +951,8 @@ pub const REVENANT_ROCKET: MissileInfo = MissileInfo {
     homing: true,
     sound: "SKEATK",
     burst_sound: "BAREXP",
+    blast: 0.0,
+    spray: false,
 };
 
 pub const MANCUBUS_BALL: MissileInfo = MissileInfo {
@@ -955,6 +966,8 @@ pub const MANCUBUS_BALL: MissileInfo = MissileInfo {
     homing: false,
     sound: "FIRSHT",
     burst_sound: "FIRXPL",
+    blast: 0.0,
+    spray: false,
 };
 
 pub const PLASMA_BOLT: MissileInfo = MissileInfo {
@@ -974,7 +987,79 @@ pub const PLASMA_BOLT: MissileInfo = MissileInfo {
     homing: false,
     sound: "PLASMA",
     burst_sound: "FIRXPL",
+    blast: 0.0,
+    spray: false,
 };
+
+/// The player's rocket: MT_ROCKET, which A_Explode bursts for 128.
+pub const ROCKET: MissileInfo = MissileInfo {
+    sprite: "MISL",
+    fly: &[b(b'A', 1, Idle)],
+    burst_sprite: "MISL",
+    burst: &[b(b'B', 8, Idle), b(b'C', 6, Idle), b(b'D', 4, Idle)],
+    speed: 20.0,
+    radius: 11.0,
+    damage: 20,
+    homing: false,
+    sound: "RLAUNC",
+    burst_sound: "BAREXP",
+    blast: 128.0,
+    spray: false,
+};
+
+/// The plasma rifle's ball: MT_PLASMA.
+pub const PLASMA_BALL: MissileInfo = MissileInfo {
+    sprite: "PLSS",
+    fly: &[b(b'A', 6, Idle), b(b'B', 6, Idle)],
+    burst_sprite: "PLSE",
+    burst: &[
+        b(b'A', 4, Idle),
+        b(b'B', 4, Idle),
+        b(b'C', 4, Idle),
+        b(b'D', 4, Idle),
+        b(b'E', 4, Idle),
+    ],
+    speed: 25.0,
+    radius: 13.0,
+    damage: 5,
+    homing: false,
+    sound: "PLASMA",
+    burst_sound: "FIRXPL",
+    blast: 0.0,
+    spray: false,
+};
+
+/// The BFG9000's ball: MT_BFG. Its burst's third frame sprays the tracers
+/// (A_BFGSpray). The weapon plays its sound as it charges.
+pub const BFG_BALL: MissileInfo = MissileInfo {
+    sprite: "BFS1",
+    fly: &[b(b'A', 4, Idle), b(b'B', 4, Idle)],
+    burst_sprite: "BFE1",
+    burst: &[
+        b(b'A', 8, Idle),
+        b(b'B', 8, Idle),
+        b(b'C', 8, Idle),
+        b(b'D', 8, Idle),
+        b(b'E', 8, Idle),
+        b(b'F', 8, Idle),
+    ],
+    speed: 25.0,
+    radius: 13.0,
+    damage: 100,
+    homing: false,
+    sound: "",
+    burst_sound: "RXPLOD",
+    blast: 0.0,
+    spray: true,
+};
+
+/// The burst a BFG tracer leaves on what it hits: MT_EXTRABFG.
+pub const BFG_HIT: &[Frame] = &[
+    b(b'A', 8, Idle),
+    b(b'B', 8, Idle),
+    b(b'C', 8, Idle),
+    b(b'D', 8, Idle),
+];
 
 /// A thing that only stands, animates and maybe blocks, or is picked up.
 #[derive(Debug)]
@@ -987,8 +1072,8 @@ pub struct DecorInfo {
     pub solid: bool,
     /// Hangs from the ceiling.
     pub hanging: bool,
-    /// Health it gives when picked up, and the most it gives up to.
-    pub health: Option<(i32, i32)>,
+    /// What touching it gives, for items.
+    pub pickup: Option<Pickup>,
 }
 
 /// One frame, shown forever.
@@ -1028,7 +1113,7 @@ const fn decor(
         frames,
         solid,
         hanging: false,
-        health: Option::None,
+        pickup: Option::None,
     }
 }
 
@@ -1044,59 +1129,145 @@ const fn hanging(
     }
 }
 
+/// An item that is picked up.
+const fn item(
+    doomednum: u16,
+    sprite: &'static str,
+    frames: &'static [Frame],
+    pickup: Pickup,
+) -> DecorInfo {
+    DecorInfo {
+        pickup: Some(pickup),
+        ..decor(doomednum, sprite, frames, false)
+    }
+}
+
 const fn health(
     doomednum: u16,
     sprite: &'static str,
     frames: &'static [Frame],
     gives: i32,
     up_to: i32,
+    message: &'static str,
 ) -> DecorInfo {
-    DecorInfo {
-        health: Some((gives, up_to)),
-        ..decor(doomednum, sprite, frames, false)
-    }
+    item(
+        doomednum,
+        sprite,
+        frames,
+        Pickup::Health {
+            gives,
+            up_to,
+            message,
+        },
+    )
+}
+
+/// Frame A, shown forever, for items built by the helpers below.
+const STILL_A: &[Frame] = still!(b'A');
+
+const fn ammo(
+    doomednum: u16,
+    sprite: &'static str,
+    kind: AmmoKind,
+    clips: i32,
+    message: &'static str,
+) -> DecorInfo {
+    item(
+        doomednum,
+        sprite,
+        STILL_A,
+        Pickup::Ammo {
+            kind,
+            clips,
+            message,
+        },
+    )
+}
+
+const fn weapon(doomednum: u16, sprite: &'static str, kind: WeaponKind) -> DecorInfo {
+    item(doomednum, sprite, STILL_A, Pickup::Weapon(kind))
+}
+
+const fn key(doomednum: u16, sprite: &'static str, key: Key) -> DecorInfo {
+    item(doomednum, sprite, BLINK, Pickup::Key(key))
 }
 
 /// Decorations and items, by editor number.
 pub const DECOR: &[DecorInfo] = &[
-    // Health: the only items picked up.
-    health(2011, "STIM", still!(b'A'), 10, 100),
-    health(2012, "MEDI", still!(b'A'), 25, 100),
-    health(2014, "BON1", PULSE, 1, 200),
+    // Items picked up.
+    health(2011, "STIM", still!(b'A'), 10, 100, "Picked up a stimpack."),
+    health(2012, "MEDI", still!(b'A'), 25, 100, "Picked up a medikit."),
+    health(2014, "BON1", PULSE, 1, 200, "Picked up a health bonus."),
+    item(2023, "PSTR", &[b(b'A', -1, Idle)], Pickup::Berserk),
+    key(5, "BKEY", Key::BlueCard),
+    key(6, "YKEY", Key::YellowCard),
+    key(13, "RKEY", Key::RedCard),
+    key(40, "BSKU", Key::BlueSkull),
+    key(39, "YSKU", Key::YellowSkull),
+    key(38, "RSKU", Key::RedSkull),
+    weapon(2001, "SHOT", WeaponKind::Shotgun),
+    weapon(82, "SGN2", WeaponKind::SuperShotgun),
+    weapon(2002, "MGUN", WeaponKind::Chaingun),
+    weapon(2003, "LAUN", WeaponKind::Missile),
+    weapon(2004, "PLAS", WeaponKind::Plasma),
+    weapon(2006, "BFUG", WeaponKind::Bfg),
+    weapon(2005, "CSAW", WeaponKind::Chainsaw),
+    ammo(2007, "CLIP", AmmoKind::Bullets, 1, "Picked up a clip."),
+    ammo(
+        2048,
+        "AMMO",
+        AmmoKind::Bullets,
+        5,
+        "Picked up a box of bullets.",
+    ),
+    ammo(
+        2008,
+        "SHEL",
+        AmmoKind::Shells,
+        1,
+        "Picked up 4 shotgun shells.",
+    ),
+    ammo(
+        2049,
+        "SBOX",
+        AmmoKind::Shells,
+        5,
+        "Picked up a box of shotgun shells.",
+    ),
+    ammo(2010, "ROCK", AmmoKind::Rockets, 1, "Picked up a rocket."),
+    ammo(
+        2046,
+        "BROK",
+        AmmoKind::Rockets,
+        5,
+        "Picked up a box of rockets.",
+    ),
+    ammo(
+        2047,
+        "CELL",
+        AmmoKind::Cells,
+        1,
+        "Picked up an energy cell.",
+    ),
+    ammo(
+        17,
+        "CELP",
+        AmmoKind::Cells,
+        5,
+        "Picked up an energy cell pack.",
+    ),
+    item(8, "BPAK", still!(b'A'), Pickup::Backpack),
     // Other items, shown only.
     decor(2015, "BON2", PULSE, false),
     decor(2018, "ARM1", BLINK, false),
     decor(2019, "ARM2", BLINK, false),
     decor(2013, "SOUL", PULSE, false),
     decor(2022, "PINV", FLICKER, false),
-    decor(2023, "PSTR", &[b(b'A', -1, Idle)], false),
     decor(2024, "PINS", FLICKER, false),
     decor(2025, "SUIT", &[b(b'A', -1, Idle)], false),
     decor(2026, "PMAP", PULSE, false),
     decor(2045, "PVIS", BLINK, false),
     decor(83, "MEGA", FLICKER, false),
-    decor(5, "BKEY", BLINK, false),
-    decor(6, "YKEY", BLINK, false),
-    decor(13, "RKEY", BLINK, false),
-    decor(40, "BSKU", BLINK, false),
-    decor(39, "YSKU", BLINK, false),
-    decor(38, "RSKU", BLINK, false),
-    decor(2001, "SHOT", still!(b'A'), false),
-    decor(82, "SGN2", still!(b'A'), false),
-    decor(2002, "MGUN", still!(b'A'), false),
-    decor(2003, "LAUN", still!(b'A'), false),
-    decor(2004, "PLAS", still!(b'A'), false),
-    decor(2006, "BFUG", still!(b'A'), false),
-    decor(2005, "CSAW", still!(b'A'), false),
-    decor(2007, "CLIP", still!(b'A'), false),
-    decor(2048, "AMMO", still!(b'A'), false),
-    decor(2008, "SHEL", still!(b'A'), false),
-    decor(2049, "SBOX", still!(b'A'), false),
-    decor(2010, "ROCK", still!(b'A'), false),
-    decor(2046, "BROK", still!(b'A'), false),
-    decor(2047, "CELL", still!(b'A'), false),
-    decor(17, "CELP", still!(b'A'), false),
-    decor(8, "BPAK", still!(b'A'), false),
     // Decorations.
     decor(2028, "COLU", &[b(b'A', -1, Idle)], true),
     decor(30, "COL1", still!(b'A'), true),
@@ -1210,6 +1381,18 @@ pub fn decor_info(doomednum: u16) -> Option<&'static DecorInfo> {
     DECOR.iter().find(|d| d.doomednum == doomednum)
 }
 
+/// The item a monster drops when it dies, by editor number: p_inter.c
+/// `P_KillMobj`'s clip, shotgun and chaingun.
+pub fn drop_of(doomednum: u16) -> Option<&'static DecorInfo> {
+    let item = match doomednum {
+        3004 | 84 => 2007,
+        9 => 2001,
+        65 => 2002,
+        _ => return None,
+    };
+    decor_info(item)
+}
+
 /// The bullet puff and blood, shown where hitscans land.
 pub const PUFF: &[Frame] = &[
     b(b'A', 4, Idle),
@@ -1219,11 +1402,215 @@ pub const PUFF: &[Frame] = &[
 ];
 pub const BLOOD: &[Frame] = &[f(b'C', 8, Idle), f(b'B', 8, Idle), f(b'A', 8, Idle)];
 
-/// The chaingun as the player holds it: CHGG A and B, with flash CHGF A
-/// and B, each shot 4 tics.
-pub const CHAINGUN_SPRITE: &str = "CHGG";
-pub const CHAINGUN_FLASH: &str = "CHGF";
+/// What a weapon frame does as it starts: p_pspr.c's action functions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WAction {
+    None,
+    /// A_WeaponReady: lower for a switch or death, fire on the trigger.
+    Ready,
+    /// A_ReFire: fire again while the trigger is held.
+    ReFire,
+    /// A_GunFlash: the flash, before the rocket or the BFG's ball.
+    GunFlash,
+    Punch,
+    Saw,
+    Pistol,
+    Shotgun,
+    SuperShotgun,
+    /// Lowers the super shotgun when it hasn't two shells.
+    CheckReload,
+    OpenShotgun2,
+    LoadShotgun2,
+    /// Its sound, then A_ReFire.
+    CloseShotgun2,
+    ChainGun,
+    Missile,
+    Plasma,
+    BfgSound,
+    Bfg,
+}
 
+/// A frame of the weapon in hand, or of its flash.
+#[derive(Clone, Copy, Debug)]
+pub struct WFrame {
+    pub letter: u8,
+    pub tics: i32,
+    pub bright: bool,
+    pub action: WAction,
+}
+
+const fn w(letter: u8, tics: i32, action: WAction) -> WFrame {
+    WFrame {
+        letter,
+        tics,
+        bright: false,
+        action,
+    }
+}
+
+/// A full-bright flash frame.
+const fn wf(letter: u8, tics: i32) -> WFrame {
+    WFrame {
+        letter,
+        tics,
+        bright: true,
+        action: WAction::None,
+    }
+}
+
+/// A weapon as the player holds it: its frames from info.c. Raising and
+/// lowering show the first ready frame.
+#[derive(Debug)]
+pub struct WeaponInfo {
+    pub sprite: &'static str,
+    pub flash_sprite: &'static str,
+    /// Looping while it waits for the trigger.
+    pub ready: &'static [WFrame],
+    /// From the trigger back to `ready`; A_ReFire jumps to its start.
+    pub attack: &'static [WFrame],
+    /// Muzzle flashes, which firing starts: the chaingun's by its frame,
+    /// the plasma rifle's at random.
+    pub flashes: &'static [&'static [WFrame]],
+}
+
+const fn ready_one(letter: u8) -> [WFrame; 1] {
+    [w(letter, 1, WAction::Ready)]
+}
+
+pub const FIST: WeaponInfo = WeaponInfo {
+    sprite: "PUNG",
+    flash_sprite: "PUNG",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'B', 4, WAction::None),
+        w(b'C', 4, WAction::Punch),
+        w(b'D', 5, WAction::None),
+        w(b'C', 4, WAction::None),
+        w(b'B', 5, WAction::ReFire),
+    ],
+    flashes: &[],
+};
+
+pub const PISTOL: WeaponInfo = WeaponInfo {
+    sprite: "PISG",
+    flash_sprite: "PISF",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'A', 4, WAction::None),
+        w(b'B', 6, WAction::Pistol),
+        w(b'C', 4, WAction::None),
+        w(b'B', 5, WAction::ReFire),
+    ],
+    flashes: &[&[wf(b'A', 7)]],
+};
+
+pub const SHOTGUN: WeaponInfo = WeaponInfo {
+    sprite: "SHTG",
+    flash_sprite: "SHTF",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'A', 3, WAction::None),
+        w(b'A', 7, WAction::Shotgun),
+        w(b'B', 5, WAction::None),
+        w(b'C', 5, WAction::None),
+        w(b'D', 4, WAction::None),
+        w(b'C', 5, WAction::None),
+        w(b'B', 5, WAction::None),
+        w(b'A', 3, WAction::None),
+        w(b'A', 7, WAction::ReFire),
+    ],
+    flashes: &[&[wf(b'A', 4), wf(b'B', 3)]],
+};
+
+pub const SUPER_SHOTGUN: WeaponInfo = WeaponInfo {
+    sprite: "SHT2",
+    flash_sprite: "SHT2",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'A', 3, WAction::None),
+        w(b'A', 7, WAction::SuperShotgun),
+        w(b'B', 7, WAction::None),
+        w(b'C', 7, WAction::CheckReload),
+        w(b'D', 7, WAction::OpenShotgun2),
+        w(b'E', 7, WAction::None),
+        w(b'F', 7, WAction::LoadShotgun2),
+        w(b'G', 6, WAction::None),
+        w(b'H', 6, WAction::CloseShotgun2),
+        w(b'A', 5, WAction::None),
+    ],
+    flashes: &[&[wf(b'I', 5), wf(b'J', 4)]],
+};
+
+pub const CHAINGUN: WeaponInfo = WeaponInfo {
+    sprite: "CHGG",
+    flash_sprite: "CHGF",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'A', 4, WAction::ChainGun),
+        w(b'B', 4, WAction::ChainGun),
+        w(b'B', 0, WAction::ReFire),
+    ],
+    flashes: &[&[wf(b'A', 5)], &[wf(b'B', 5)]],
+};
+
+pub const ROCKET_LAUNCHER: WeaponInfo = WeaponInfo {
+    sprite: "MISG",
+    flash_sprite: "MISF",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'B', 8, WAction::GunFlash),
+        w(b'B', 12, WAction::Missile),
+        w(b'B', 0, WAction::ReFire),
+    ],
+    flashes: &[&[wf(b'A', 3), wf(b'B', 4), wf(b'C', 4), wf(b'D', 4)]],
+};
+
+pub const PLASMA_RIFLE: WeaponInfo = WeaponInfo {
+    sprite: "PLSG",
+    flash_sprite: "PLSF",
+    ready: &ready_one(b'A'),
+    attack: &[w(b'A', 3, WAction::Plasma), w(b'B', 20, WAction::ReFire)],
+    flashes: &[&[wf(b'A', 4)], &[wf(b'B', 4)]],
+};
+
+pub const BFG9000: WeaponInfo = WeaponInfo {
+    sprite: "BFGG",
+    flash_sprite: "BFGF",
+    ready: &ready_one(b'A'),
+    attack: &[
+        w(b'A', 20, WAction::BfgSound),
+        w(b'B', 10, WAction::GunFlash),
+        w(b'B', 10, WAction::Bfg),
+        w(b'B', 20, WAction::ReFire),
+    ],
+    flashes: &[&[wf(b'A', 11), wf(b'B', 6)]],
+};
+
+pub const CHAINSAW: WeaponInfo = WeaponInfo {
+    sprite: "SAWG",
+    flash_sprite: "SAWG",
+    ready: &[w(b'C', 4, WAction::Ready), w(b'D', 4, WAction::Ready)],
+    attack: &[
+        w(b'A', 4, WAction::Saw),
+        w(b'B', 4, WAction::Saw),
+        w(b'B', 0, WAction::ReFire),
+    ],
+    flashes: &[],
+};
+
+pub fn weapon_info(kind: WeaponKind) -> &'static WeaponInfo {
+    match kind {
+        WeaponKind::Fist => &FIST,
+        WeaponKind::Pistol => &PISTOL,
+        WeaponKind::Shotgun => &SHOTGUN,
+        WeaponKind::Chaingun => &CHAINGUN,
+        WeaponKind::Missile => &ROCKET_LAUNCHER,
+        WeaponKind::Plasma => &PLASMA_RIFLE,
+        WeaponKind::Bfg => &BFG9000,
+        WeaponKind::Chainsaw => &CHAINSAW,
+        WeaponKind::SuperShotgun => &SUPER_SHOTGUN,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,5 +1656,53 @@ mod tests {
         numbers.sort_unstable();
         numbers.dedup();
         assert_eq!(numbers.len(), count, "an editor number is listed twice");
+    }
+
+    #[test]
+    fn weapons_fire_once_a_cycle_and_come_back_to_ready() {
+        for kind in WeaponKind::ALL {
+            let info = weapon_info(kind);
+            assert!(info
+                .ready
+                .iter()
+                .all(|f| f.action == WAction::Ready && f.tics > 0));
+            let fires = info
+                .attack
+                .iter()
+                .filter(|f| {
+                    !matches!(
+                        f.action,
+                        WAction::None
+                            | WAction::ReFire
+                            | WAction::GunFlash
+                            | WAction::BfgSound
+                            | WAction::CheckReload
+                            | WAction::OpenShotgun2
+                            | WAction::LoadShotgun2
+                            | WAction::CloseShotgun2
+                    )
+                })
+                .count();
+            let want = if kind == WeaponKind::Chaingun || kind == WeaponKind::Chainsaw {
+                2
+            } else {
+                1
+            };
+            assert_eq!(fires, want, "{kind:?}");
+            assert!(
+                info.attack.iter().any(|f| matches!(
+                    f.action,
+                    WAction::ReFire | WAction::CloseShotgun2
+                )),
+                "{kind:?}"
+            );
+            assert!(info.attack.iter().any(|f| f.tics > 0), "{kind:?}");
+        }
+        // DOOM's rates held: the pistol every 19 tics, the chaingun two
+        // shots in 8, the shotgun every 44.
+        let cycle = |w: &WeaponInfo| w.attack.iter().map(|f| f.tics).sum::<i32>();
+        assert_eq!(cycle(&PISTOL), 19);
+        assert_eq!(cycle(&CHAINGUN), 8);
+        assert_eq!(cycle(&SHOTGUN), 44);
     }
 }

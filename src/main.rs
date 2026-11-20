@@ -11,6 +11,7 @@ mod debris;
 mod hud;
 mod info;
 mod input;
+mod inventory;
 mod levels;
 mod movers;
 mod player;
@@ -141,6 +142,7 @@ fn main() -> AppExit {
         mode: if args.fly { Mode::Fly } else { Mode::Walk },
         god: args.god,
         health: args.health,
+        inventory: args.inventory,
         units: s,
     };
     let [r, g, b] = map.sky_colour();
@@ -222,6 +224,7 @@ fn main() -> AppExit {
     .init_resource::<world::EditedChunks>()
     .init_resource::<player::Blockers>()
     .init_resource::<input::Intent>()
+    .init_resource::<hud::HudMessage>()
     .insert_resource(MapLabel {
         name: map_name,
         units_per_voxel: args.units_per_voxel,
@@ -250,7 +253,14 @@ fn main() -> AppExit {
     )
     .add_systems(
         Update,
-        (sprites::draw_billboards, hud::update_hud, hud::draw_gun).after(player::walk),
+        (
+            sprites::draw_billboards,
+            hud::update_hud,
+            hud::update_status,
+            hud::draw_keys,
+            hud::draw_gun,
+        )
+            .after(player::walk),
     );
     if let Some(steps) = args.script.clone() {
         app.insert_resource(input::Script::new(steps)).add_systems(
@@ -270,7 +280,7 @@ fn main() -> AppExit {
         .expect("nothing panics holding it")
         .take();
     match next {
-        Some((map, health)) if exit == AppExit::Success => levels::relaunch(&map, health),
+        Some(carried) if exit == AppExit::Success => levels::relaunch(&carried),
         _ => exit,
     }
 }

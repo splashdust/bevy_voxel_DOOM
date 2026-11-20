@@ -10,14 +10,15 @@
 //! - `jump`: jump, and `jw:S` jump while walking forward for S seconds;
 //! - `turn:DEG`: turn left by DEG degrees (right when negative);
 //! - `pitch:DEG`: look DEG degrees up from level;
-//! - `fire:N`: hold the trigger for N chaingun shots;
+//! - `fire:N`: hold the trigger for as long as N chaingun shots take;
+//! - `weapon:N`: press number key N to switch weapons;
 //! - `use`: press use once;
 //! - `wait:S`: stand still for S seconds;
 //! - `shot:PATH`: save a screenshot;
 //! - `respawn`: respawn, when dead.
 
 use bevy::{
-    input::mouse::AccumulatedMouseMotion,
+    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
     prelude::*,
     render::view::screenshot::{save_to_disk, Screenshot},
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
@@ -27,6 +28,18 @@ use crate::capture::WorldSettled;
 
 /// Radians per pixel of mouse motion.
 const MOUSE_SENSITIVITY: f32 = 0.0022;
+/// Pixels of scrolling that step one weapon, on a touchpad.
+const SCROLL_PIXELS: f32 = 40.0;
+/// The number keys that pick weapons, 1 to 7.
+const WEAPON_KEYS: [KeyCode; 7] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+];
 
 /// This frame's wishes.
 #[derive(Resource, Default, Debug, Clone)]
@@ -53,6 +66,10 @@ pub struct Intent {
     pub toggle_fly: bool,
     /// R or a click while dead: respawn.
     pub respawn: bool,
+    /// A number key pressed this frame, 1 to 7: pick that weapon.
+    pub weapon_slot: Option<u8>,
+    /// Mouse wheel steps this frame: positive for the next weapon.
+    pub weapon_step: i32,
 }
 
 /// One step of a script.
@@ -73,6 +90,8 @@ pub enum Step {
     Shot(String),
     Respawn,
     Use,
+    /// Press a weapon number key.
+    Weapon(u8),
 }
 
 /// A scripted run; see the module docs.
@@ -143,6 +162,12 @@ pub fn parse_script(text: &str) -> Result<Vec<Step>, String> {
                 "shot" if !arg.is_empty() => Ok(Step::Shot(arg.to_string())),
                 "respawn" => Ok(Step::Respawn),
                 "use" => Ok(Step::Use),
+                "weapon" => match number()? as u8 {
+                    n @ 1..=7 => Ok(Step::Weapon(n)),
+                    _ => {
+                        Err(format!("script step {step:?} needs a weapon number 1 to 7"))
+                    }
+                },
                 _ => Err(format!("unknown script step {step:?}")),
             }
         })
@@ -152,13 +177,16 @@ pub fn parse_script(text: &str) -> Result<Vec<Step>, String> {
 /// Reads the keyboard and mouse into [`Intent`]. The click that captures
 /// the cursor doesn't fire: the trigger counts only once pressed with the
 /// cursor captured.
+#[allow(clippy::too_many_arguments)]
 pub fn read_devices(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
     cursor: Single<&CursorOptions, With<PrimaryWindow>>,
     mut intent: ResMut<Intent>,
     mut trigger: Local<bool>,
+    mut scrolled: Local<f32>,
 ) {
     let captured = cursor.grab_mode != CursorGrabMode::None;
     let axis = |plus: KeyCode, minus: KeyCode| {
@@ -180,6 +208,14 @@ pub fn read_devices(
     } else {
         (0.0, 0.0)
     };
+    // A wheel's line is a step; a touchpad's pixels add up to steps.
+    let lines = match scroll.unit {
+        MouseScrollUnit::Line => scroll.delta.y,
+        MouseScrollUnit::Pixel => scroll.delta.y / SCROLL_PIXELS,
+    };
+    *scrolled = if captured { *scrolled + lines } else { 0.0 };
+    let steps = scrolled.trunc();
+    *scrolled -= steps;
     *intent = Intent {
         forward: axis(KeyCode::KeyW, KeyCode::KeyS),
         strafe: axis(KeyCode::KeyD, KeyCode::KeyA),
@@ -196,6 +232,12 @@ pub fn read_devices(
         toggle_fly: keys.just_pressed(KeyCode::KeyV),
         respawn: keys.just_pressed(KeyCode::KeyR)
             || buttons.just_pressed(MouseButton::Left),
+        weapon_slot: (1..)
+            .zip(WEAPON_KEYS)
+            .find(|(_, key)| keys.just_pressed(*key))
+            .map(|(n, _)| n),
+        // Scrolling down, toward you, is the next weapon.
+        weapon_step: -steps as i32,
     };
 }
 
@@ -270,6 +312,10 @@ pub fn run_script(
             fresh.use_ = true;
             true
         }
+        Step::Weapon(n) => {
+            fresh.weapon_slot = Some(n);
+            true
+        }
         Step::Shot(path) => {
             if first {
                 commands
@@ -296,10 +342,13 @@ mod tests {
 
     #[test]
     fn scripts_parse() {
-        let steps =
-            parse_script("w:1.5, W:2,jump,turn:90,fire:3,shot:/tmp/a.png,wait:1,respawn")
-                .unwrap();
-        assert_eq!(steps.len(), 8);
+        let steps = parse_script(
+            "w:1.5, W:2,jump,turn:90,fire:3,shot:/tmp/a.png,wait:1,respawn,weapon:3",
+        )
+        .unwrap();
+        assert_eq!(steps.len(), 9);
+        assert_eq!(steps[8], Step::Weapon(3));
+        assert!(parse_script("weapon:8").is_err());
         assert_eq!(steps[7], Step::Respawn);
         assert_eq!(
             steps[1],

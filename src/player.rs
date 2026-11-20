@@ -12,12 +12,17 @@
 //!
 //! `V` switches to the noclip fly camera and back. At 0 health the view
 //! sinks to the floor and turns red; R or a click respawns at the start.
+//!
+//! The player carries an [`Inventory`]: weapons, ammo, keys. Touching an
+//! item picks it up, as p_inter.c `P_TouchSpecialThing` does, with a
+//! message and a yellow flash.
 
 use bevy::prelude::*;
 
 use crate::camera::FlyCamera;
 use crate::collide::{move_among, Blocker, Body};
 use crate::input::Intent;
+use crate::inventory::{Inventory, Picked, Pickup};
 use crate::movers::MoverSolids;
 use crate::world::{EditedChunks, GameMap, WorldSolid};
 use crate::{sound::PlaySound, world::DoomWorld};
@@ -63,6 +68,9 @@ pub struct PlayerStart {
     pub god: bool,
     /// Health to start with: 100, or what the last map was left with.
     pub health: i32,
+    /// What to start with: a pistol start, or what the last map was left
+    /// with.
+    pub inventory: Inventory,
     /// Map units per voxel.
     pub units: f32,
 }
@@ -80,6 +88,9 @@ pub struct Player {
     view_lag: f32,
     /// The red of the screen after taking damage, 0 to 1.
     pub hurt: f32,
+    /// The yellow of the screen after a pickup, 0 to 1.
+    pub bonus: f32,
+    pub inventory: Inventory,
     /// Seconds since dying.
     pub dead_for: f32,
     start: PlayerStart,
@@ -102,6 +113,8 @@ impl Player {
             god: start.god,
             view_lag: 0.0,
             hurt: 0.0,
+            bonus: 0.0,
+            inventory: start.inventory,
             dead_for: 0.0,
             start: *start,
             body: Body {
@@ -167,6 +180,40 @@ impl Player {
         true
     }
 
+    /// Picks up `item`, dropped by a monster or not: see
+    /// [`Inventory::pick_up`]. `None` when it gives nothing and stays.
+    pub fn pick_up(&mut self, item: Pickup, dropped: bool) -> Option<Picked> {
+        if !self.alive() {
+            return None;
+        }
+        let picked = match item {
+            Pickup::Health {
+                gives,
+                up_to,
+                message,
+            } => {
+                let low = self.health < 25;
+                self.heal(gives, up_to).then_some(Picked {
+                    message: if low && gives == 25 {
+                        "Picked up a medikit that you REALLY need!"
+                    } else {
+                        message
+                    },
+                    sound: "ITEMUP",
+                })
+            }
+            Pickup::Berserk => {
+                self.heal(100, 100);
+                self.inventory.pick_up(item, dropped)
+            }
+            _ => self.inventory.pick_up(item, dropped),
+        };
+        if picked.is_some() {
+            self.bonus = (self.bonus + 0.25).min(0.6);
+        }
+        picked
+    }
+
     pub fn describe(&self) -> String {
         format!(
             "feet {:.1} {:.1} {:.1}{} health {}",
@@ -187,6 +234,8 @@ impl Player {
         self.vel = Vec3::ZERO;
         self.health = 100;
         self.hurt = 0.0;
+        self.bonus = 0.0;
+        self.inventory.after_death();
         self.view_lag = 0.0;
         fly.yaw = self.start.yaw;
         fly.pitch = 0.0;
@@ -218,6 +267,7 @@ pub fn walk(
     let dt = time.delta_secs().min(0.1);
     let s = map.units;
     player.hurt = (player.hurt - dt * 0.8).max(0.0);
+    player.bonus = (player.bonus - dt * 1.2).max(0.0);
     if intent.toggle_fly {
         player.mode = match player.mode {
             Mode::Walk => Mode::Fly,
@@ -325,6 +375,7 @@ mod tests {
             mode: Mode::Walk,
             god: false,
             health: 100,
+            inventory: Inventory::default(),
             units: 2.0,
         };
         let mut p = Player::new(&start);
@@ -344,5 +395,38 @@ mod tests {
         assert_eq!(god.health, 100);
         assert_eq!(p.body().height, 28.0);
         assert_eq!(p.eye().y, 20.5);
+    }
+
+    #[test]
+    fn pickups_heal_and_fill_the_inventory() {
+        let start = PlayerStart {
+            feet: Vec3::ZERO,
+            yaw: 0.0,
+            mode: Mode::Walk,
+            god: false,
+            health: 20,
+            inventory: Inventory::default(),
+            units: 2.0,
+        };
+        let mut p = Player::new(&start);
+        let medikit = Pickup::Health {
+            gives: 25,
+            up_to: 100,
+            message: "Picked up a medikit.",
+        };
+        let picked = p.pick_up(medikit, false).unwrap();
+        assert!(picked.message.contains("REALLY"));
+        assert_eq!(p.health, 45);
+        assert!(p.bonus > 0.0);
+        assert!(p.pick_up(Pickup::Berserk, false).is_some());
+        assert_eq!(p.health, 100);
+        assert!(p.pick_up(medikit, false).is_none());
+        let shotgun = Pickup::Weapon(crate::inventory::WeaponKind::Shotgun);
+        assert_eq!(p.pick_up(shotgun, false).unwrap().sound, "WPNUP");
+        p.damage(500, Vec3::ZERO);
+        assert!(
+            p.pick_up(shotgun, false).is_none(),
+            "the dead pick up nothing"
+        );
     }
 }
