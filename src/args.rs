@@ -37,9 +37,11 @@ usage: doom_voxels --wad PATH [options]
                           light surfaces glow at level 15, or at their sector's level (default full)
   --stepped               show each voxel's light as a flat step instead of smoothing it
   --flash-time S          how long a shot's flash glows, in seconds (default 0.12)
-  --closed-doors          keep door sectors closed
+  --closed-doors          keep door sectors that nothing usable opens closed
   --fly                   start in the noclip fly camera instead of walking (V switches)
   --god                   take no damage
+  --health N              start with N health, 1 to 200 (default 100); an exit switch starts
+                          the next map with the health you left with
   --freeze                things stand still and don't think, for screenshots
   --frame-times           print frame time statistics every 5 seconds
   --mute                  no sound
@@ -47,7 +49,7 @@ usage: doom_voxels --wad PATH [options]
   --awake                 monsters start awake, chasing the player
   --script STEPS          play a script once the world has settled: comma-separated steps
                           w:S s:S a:S d:S (walk S seconds; capitals run), jw:S (jump while
-                          walking), jump, turn:DEG, pitch:DEG, fire:N, wait:S, shot:PATH,
+                          walking), jump, use, turn:DEG, pitch:DEG, fire:N, wait:S, shot:PATH,
                           respawn
   --pos X,Y,Z             start the camera here, in voxel coordinates
   --yaw DEG               start yaw, 0 facing DOOM's north, positive turning left
@@ -91,6 +93,7 @@ pub struct Args {
     pub freeze: bool,
     pub frame_times: bool,
     pub mute: bool,
+    pub health: i32,
     pub script: Option<Vec<crate::input::Step>>,
 }
 
@@ -267,6 +270,7 @@ fn parse_from(
         freeze: false,
         frame_times: false,
         mute: false,
+        health: 100,
         script: None,
     };
     let mut words = words.into_iter();
@@ -404,6 +408,13 @@ fn parse_from(
                             .filter(|s| *s >= 0.0)
                             .ok_or_else(|| format!("{word} needs seconds, at least 0"))?
                     }
+                    "--health" => {
+                        args.health = value
+                            .parse()
+                            .ok()
+                            .filter(|n: &i32| (1..=200).contains(n))
+                            .ok_or_else(|| format!("{word} needs a whole number from 1 to 200"))?
+                    }
                     "--script" => args.script = Some(crate::input::parse_script(&value)?),
                     "--pos" => args.pos = Some(parse_vec3(&value)?),
                     "--yaw" => args.yaw = Some(number("degrees")?),
@@ -422,6 +433,66 @@ fn parse_from(
             .to_string()
     })?;
     Ok(args)
+}
+
+/// The flags that take no value.
+const SWITCHES: &[&str] = &[
+    "--help",
+    "-h",
+    "--list-maps",
+    "--stepped",
+    "--no-vsync",
+    "--closed-doors",
+    "--fly",
+    "--god",
+    "--awake",
+    "--list-things",
+    "--freeze",
+    "--frame-times",
+    "--mute",
+];
+
+/// The flags that belong to the first map's run and don't carry on to the
+/// next map: where to start, the script and the screenshot.
+const FIRST_MAP_ONLY: &[&str] = &[
+    "--map",
+    "--health",
+    "--pos",
+    "--yaw",
+    "--pitch",
+    "--script",
+    "--fire",
+    "--screenshot",
+    "--screenshot-delay",
+];
+
+/// The command line `words` for the next map: `map` with `health`, and the
+/// other settings as they were.
+pub fn next_level_words(
+    words: impl IntoIterator<Item = String>,
+    map: &str,
+    health: i32,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        if SWITCHES.contains(&word.as_str()) {
+            out.push(word);
+            continue;
+        }
+        let value = words.next();
+        if !FIRST_MAP_ONLY.contains(&word.as_str()) {
+            out.push(word);
+            out.extend(value);
+        }
+    }
+    out.extend([
+        "--map".into(),
+        map.into(),
+        "--health".into(),
+        health.to_string(),
+    ]);
+    out
 }
 
 fn parse_vec3(text: &str) -> Result<Vec3, String> {
@@ -606,5 +677,40 @@ mod tests {
         assert_eq!((args.debris, args.screenshot_delay), (0, Some(0.5)));
         assert!(parse(&["--debris", "-1"], Some("a.wad")).is_err());
         assert!(parse(&["--screenshot-delay", "-1"], Some("a.wad")).is_err());
+    }
+
+    #[test]
+    fn the_next_map_keeps_settings_but_not_the_start() {
+        let words = |list: &str| list.split(' ').map(String::from).collect::<Vec<_>>();
+        let next = next_level_words(
+            words(
+                "--wad a.wad --map E1M1 --god --light propagated --pos 1,2,3 \
+                 --script w:1,use --health 50 --mute --quit-after 9",
+            )
+            .into_iter()
+            .filter(|w| !w.is_empty()),
+            "E1M2",
+            73,
+        );
+        assert_eq!(
+            next,
+            words(
+                "--wad a.wad --god --light propagated --mute --quit-after 9 \
+                 --map E1M2 --health 73"
+            )
+            .into_iter()
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+        );
+        let args =
+            parse(&next.iter().map(String::as_str).collect::<Vec<_>>(), None).unwrap();
+        assert_eq!((args.map.as_deref(), args.health), (Some("E1M2"), 73));
+        for switch in SWITCHES
+            .iter()
+            .filter(|s| !s.starts_with("-h") && **s != "--help")
+        {
+            assert!(parse(&[switch], Some("a.wad")).is_ok(), "{switch}");
+        }
+        assert!(parse(&["--health", "0"], Some("a.wad")).is_err());
     }
 }

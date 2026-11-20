@@ -37,6 +37,7 @@ use crate::capture::{CaptureSet, WorldSettled};
 use crate::debris::SprayDebris;
 use crate::info;
 use crate::input::Intent;
+use crate::movers::MoverSolids;
 use crate::player::Player;
 use crate::sound::PlaySound;
 use crate::sprites::SpriteBank;
@@ -136,13 +137,14 @@ pub struct Carver<'w, 's> {
     pub voxel_world: VoxelWorld<'w, 's, DoomWorld>,
     map: Res<'w, GameMap>,
     edited: Res<'w, EditedChunks>,
+    movers: Res<'w, MoverSolids>,
     spray: MessageWriter<'w, SprayDebris>,
 }
 
 impl Carver<'_, '_> {
     /// What bodies and shots collide with now.
     pub fn solid(&self) -> WorldSolid {
-        WorldSolid::new(&self.voxel_world, &self.map, &self.edited)
+        WorldSolid::new(&self.voxel_world, &self.map, &self.edited, &self.movers)
     }
 
     /// Blows a ball of `radius` voxels out of the world around `hit`, the

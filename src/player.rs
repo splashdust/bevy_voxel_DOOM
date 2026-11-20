@@ -6,7 +6,7 @@
 //! accelerates toward the speed it wants and slows when it stops at the rate
 //! DOOM's friction gives, 0.90625 a tic, with DOOM's walking and running
 //! speeds as the limits; in the air it barely steers. Gravity is DOOM's, 1
-//! unit per tic per tic. DOOM has no jump; Space jumps about 32 units, so
+//! unit per tic per tic. DOOM has no jump; C jumps about 32 units, so
 //! the player can climb out of craters. After stepping up the eye catches up
 //! over a few frames, as DOOM's view height does.
 //!
@@ -18,6 +18,7 @@ use bevy::prelude::*;
 use crate::camera::FlyCamera;
 use crate::collide::{move_among, Blocker, Body};
 use crate::input::Intent;
+use crate::movers::MoverSolids;
 use crate::world::{EditedChunks, GameMap, WorldSolid};
 use crate::{sound::PlaySound, world::DoomWorld};
 use bevy_voxel_world::prelude::*;
@@ -60,6 +61,8 @@ pub struct PlayerStart {
     pub yaw: f32,
     pub mode: Mode,
     pub god: bool,
+    /// Health to start with: 100, or what the last map was left with.
+    pub health: i32,
     /// Map units per voxel.
     pub units: f32,
 }
@@ -94,7 +97,7 @@ impl Player {
             feet: start.feet,
             vel: Vec3::ZERO,
             grounded: false,
-            health: 100,
+            health: start.health,
             mode: start.mode,
             god: start.god,
             view_lag: 0.0,
@@ -205,6 +208,7 @@ pub fn walk(
     intent: Res<Intent>,
     map: Res<GameMap>,
     edited: Res<EditedChunks>,
+    movers: Res<MoverSolids>,
     voxel_world: VoxelWorld<DoomWorld>,
     blockers: Res<Blockers>,
     camera: Single<(&mut FlyCamera, &mut Transform, &mut Player)>,
@@ -230,7 +234,7 @@ pub fn walk(
         player.ground_speed = 0.0;
         return;
     }
-    let world = WorldSolid::new(&voxel_world, &map, &edited);
+    let world = WorldSolid::new(&voxel_world, &map, &edited, &movers);
     let alive = player.alive();
     if !alive {
         player.dead_for += dt;
@@ -320,6 +324,7 @@ mod tests {
             yaw: 0.0,
             mode: Mode::Walk,
             god: false,
+            health: 100,
             units: 2.0,
         };
         let mut p = Player::new(&start);

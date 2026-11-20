@@ -198,6 +198,7 @@ pub struct TextureSet {
 }
 
 /// One map's lumps, decoded. Coordinates are DOOM map units.
+#[derive(Default)]
 pub struct MapData {
     pub name: String,
     pub things: Vec<Thing>,

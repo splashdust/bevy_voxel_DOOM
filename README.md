@@ -16,7 +16,7 @@ The workspace has three parts:
 |---|---|
 | `crates/wad` (`doom_wad`) | reads WAD files: map lumps, the palette, COLORMAP, flats, wall textures, sprites and sounds |
 | `crates/voxelize` (`doom_voxelize`) | turns one map into voxels: `VoxelMap` |
-| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things, the weapon and its debris |
+| `src/` (`doom_voxels`) | the Bevy app: the voxel world, the palette material, the player, monsters and things, doors and lifts, the weapon and its debris |
 
 ## Running
 
@@ -42,7 +42,8 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | mouse | look (the cursor is captured) |
 | W A S D | walk forward, back, left, right; in fly mode, fly |
 | Shift | run; in fly mode, three times faster |
-| Space | jump; in fly mode, up |
+| Space | use: open a door, press a switch; in fly mode, also up |
+| C | jump (DOOM has none) |
 | Ctrl | in fly mode, down |
 | left click | fire; hold for a chaingun's rate. The click that captures the cursor doesn't fire |
 | V | switch between walking and the noclip fly camera |
@@ -71,15 +72,16 @@ Never commit a WAD: id's are copyrighted, and `.gitignore` keeps `*.wad` out.
 | `--stepped` | show each voxel's light as a flat step instead of smoothing it |
 | `--flash-time S` | how long a shot's flash glows, 0.12 s by default. A long time keeps flashes on for a screenshot |
 | `--no-vsync` | don't wait for the display, so the HUD's frame rate shows what a frame costs |
-| `--closed-doors` | keep door sectors closed; they are baked open by default |
+| `--closed-doors` | keep closed the door sectors that nothing usable opens; they are baked open by default. Doors that Space opens start closed either way |
 | `--fly` | start in the noclip fly camera instead of walking; V switches |
 | `--god` | take no damage |
+| `--health N` | start with N health, 1 to 200 (default 100); an exit switch starts the next map with the health you left with |
 | `--awake` | monsters start awake, chasing the player |
 | `--freeze` | things stand still and don't think, for screenshots |
 | `--mute` | no sound |
 | `--list-things` | print where each monster stands, in voxels |
 | `--frame-times` | every 5 seconds print frame time statistics and where the monster tics spend their time |
-| `--script STEPS` | once the world has settled, play comma-separated steps: `w:S`, `s:S`, `a:S`, `d:S` walk for S seconds (capitals run), `jw:S` jump while walking, `jump`, `turn:DEG` (positive left), `pitch:DEG`, `fire:N` shots, `wait:S`, `shot:PATH` save a screenshot, `respawn`. Each step prints the player's position. The cursor isn't captured, and `--screenshot` waits for the script |
+| `--script STEPS` | once the world has settled, play comma-separated steps: `w:S`, `s:S`, `a:S`, `d:S` walk for S seconds (capitals run), `jw:S` jump while walking, `jump`, `use`, `turn:DEG` (positive left), `pitch:DEG`, `fire:N` shots, `wait:S`, `shot:PATH` save a screenshot, `respawn`. Each step prints the player's position. The cursor isn't captured, and `--screenshot` waits for the script |
 | `--pos X,Y,Z` | start the camera (the eye, when walking) here, in voxels, instead of at player 1's start |
 | `--yaw DEG` | start yaw: 0 faces DOOM's north, positive turns left |
 | `--pitch DEG` | start pitch, positive looks up |
@@ -184,10 +186,45 @@ its north is −z.
   and no farther away. Movement uses DOOM's numbers: walking and running
   speeds of 8.3 and 16.7 units a tic, reached and lost at the rate of
   DOOM's friction, and its gravity of 1 unit a tic a tic. The player barely
-  steers in the air. DOOM has no jump; Space jumps about 32 units, which
+  steers in the air. DOOM has no jump; C jumps about 32 units, which
   with the step climbs out of most craters. After a step up the eye catches
   up over a few frames, as DOOM's view height does. Health is 100; at 0 the
   view sinks and turns red until R or a click respawns at the start.
+- **Doors, lifts and moving floors** (`src/specials.rs`, `src/movers.rs`).
+  Every sector a use special moves is a mover: manual doors (DR and D1,
+  keyed ones without the key), and the sectors tagged by switches and
+  buttons (S1 and SR) that open or close doors, lower lifts, raise or lower
+  floors, or lower a ceiling to the floor. The map is built twice, in
+  parallel: the world with each mover's plane at the end of its travel that
+  leaves the most air (a door open, a lift down, a floor at its lowest),
+  and a second build with it at the other end. The voxels of that second
+  build between the two ends, only their shell, go into a sub-grid per
+  mover, which slides along y as the plane moves: a door rises into the
+  solid above its frame, a lift sinks into the solid below. At the world's
+  end a sub-grid is hidden, since its face would lie on the world's.
+  Movers run at DOOM's 35 tics a second with DOOM's speeds, waits and
+  sounds, drawn between tics. Collision, sight and shots see a mover as the
+  whole rows of its sector's columns between the world's plane and the
+  moving one, so a body stands up to half a voxel off a lift's drawn top
+  while it moves. A rising floor carries the player and monsters standing
+  on it; a lift rising into a ceiling with a body on it goes back down, and
+  a closing door goes back up from a body in its way, as DOOM's do. Space
+  traces DOOM's 64 units from the player along the view's yaw, through
+  two-sided lines with an opening, as `P_UseLines` does: the first line
+  with a use special is used from its front side, and a wall says "oof". A
+  switch flips between its `SW1` and `SW2` textures by editing the world's
+  wall voxels (`VoxelMap::switch_voxels`), and a button flips back after a
+  second.
+- **Exits** (`src/levels.rs`). An exit switch picks the next map as
+  `G_DoCompleted` does: the next map of the episode, `E?M9` from a secret
+  exit and back from it to where it was found (`MAP31` and `MAP32` in
+  DOOM II), and the next episode's first map after `E?M8` when the WAD has
+  it. The world, its sub-grids, monsters and light are all built for one
+  map at startup, so a second after the switch the app exits and `main`
+  starts the program again for the next map, on Unix in the same process
+  through `exec`. The new run keeps the command line's settings, drops the
+  first map's start, script and screenshot, and starts with `--health` set
+  to what the player left with.
 - **Sprites** (`crates/wad/src/sprite.rs`, `src/sprites.rs`). The WAD
   reader lists the sprite lumps between `S_START` and `S_END` (and the
   `SS_` markers) by prefix, frame letter and rotation, a second
@@ -307,7 +344,9 @@ its north is −z.
   under the air takes the floor flat, the one over it the ceiling flat, and
   solid voxels beside air take the wall texture of the linedef between them,
   with DOOM's pegging rules. Masked middle textures (grates) are one-voxel
-  slabs whose transparent texels are air. Doors are baked open. Sector light
+  slabs whose transparent texels are air. Doors are baked open, and
+  `Options::heights` builds any sector at other heights, which the movers
+  use. Sector light
   goes through COLORMAP at a fixed viewing distance.
 - **Inside the solid.** Hidden solid voxels carry the nearest surface on
   into the solid, so a crater shows material rather than a hole: the floor
@@ -326,8 +365,22 @@ its north is −z.
 - A corner column touching two different walls shows one wall's texture.
 - Walls beside sky sectors run up to the map top with their texture, where
   DOOM would paint sky above them.
-- Animated flats and textures, and switches, show their first frame.
-- Doors, lifts and crushers don't move.
+- Animated flats and textures show their first frame.
+- Only the use key moves sectors: lines set off by walking over or shooting
+  them do nothing, and their doors stay baked open. Stairs, donuts,
+  crushers, light changes and sector specials don't happen, and keys
+  aren't needed. A sector moves one plane, the one its first special
+  names. Specials work out their heights from the map's stored ones, so an
+  SR floor raise goes to the same height each time, where DOOM's goes on
+  to the next. Walk-over exits do nothing, and a new map opens a new
+  window, with no intermission screen between maps and no finale at the
+  end of an episode or the game.
+- A lift's sides show the lift's own walls as built at its top, so the
+  lower texture DOOM draws on the walls beside a lowered lift is where the
+  world was built for it, and a door's bottom row of voxels shows its
+  ceiling flat on its sides too.
+- Doors, lifts and floors can't be carved: a shot stops on them and carves
+  the world behind, and debris passes through them.
 - Propagated light is white: a red torch lights its alcove white. And it
   reaches 32 voxels at most, 64 map units at 2 units per voxel, so a lamp
   lights a pool beside it and most of a big room stays at `--min-light`.
@@ -356,8 +409,6 @@ its north is −z.
 - With the camera close to a wall only a few chunks spawn, and the light
   beside a lamp in the next chunk can read black until more of the room
   spawns, though `light_is_settled` says it has settled.
-- With `--closed-doors`, the bottom face of a closed door shows the ceiling
-  flat instead of the door texture.
 - Inside the solid, each column takes one neighbouring sector, so where two
   walls or a wall and a step meet, the inside shows only one of them. The
   top of the world over non-sky ceilings stays black.
@@ -378,7 +429,7 @@ its north is −z.
   (a projectile doesn't hurt its own species), but the one hurt doesn't
   turn on the one that hurt it.
 - Monsters walk off ledges of any height, where DOOM's won't step down
-  more than 24 units, and nothing opens doors.
+  more than 24 units, and don't open doors.
 - Melee range, barrel blasts and pickups measure across the floor as DOOM
   does, plus a vertical limit, so a monster can't claw through a floor.
   Sight is one trace eye to eye; DOOM's REJECT table isn't used.
@@ -418,13 +469,14 @@ its north is −z.
 
 ## Which bevy_voxel_world
 
-The experiment builds against the released crate from crates.io:
+The experiment builds against an unreleased commit of the crate's `main`,
+for sub-grids:
 
 ```toml
-bevy_voxel_world = { version = "0.19.3", features = ["light_propagation"] }
+bevy_voxel_world = { git = "https://github.com/splashdust/bevy_voxel_world", rev = "6bba173", features = ["light_propagation", "sub_grids"] }
 ```
 
-To try a branch of the crate, point it at a commit instead:
+To try another branch of the crate, point it at its commit:
 
 ```toml
 bevy_voxel_world = { git = "https://github.com/splashdust/bevy_voxel_world", rev = "<commit>", features = ["light_propagation"] }
@@ -548,6 +600,28 @@ work around:
   screen until its voxel shows, or the pile blinks. The app waits for a
   `ChunkPublished` of the chunk after the frame the edit was set, with the
   chunk `Ready`, and two frames more for the mesh to reach the screen.
+- **Sub-grids made doors and lifts a few hundred lines.** Spawning one
+  per mover, filling it with `grid_mut(Grid::SubGrid(..)).set_voxels_in`
+  and moving its `Transform` was all the voxel side needed: the world's
+  mesher, material and texture index mapper show it as they show the
+  world. Three things took finding:
+  - `VoxelWorld::chunk_state` answers for the world's grid, and
+    `Query<&Chunk<C>>` returns sub-grids' chunks too, whose keys are on
+    their own grids. The screenshot's settling check asked the world about
+    every chunk, so it never settled once a map had doors; it now asks
+    `voxel_world.grid(chunk.grid())`. `ChunkPublished` likewise fires for
+    sub-grids' chunks, and the debris filters on its `grid`.
+  - A custom fragment shader in a lit world has to switch from
+    `sample_light` to `sample_face_light`, with `world_grid_position` under
+    `SUB_GRIDS`, or sub-grids show unlit: `sample_light` reads only the
+    sub-grid's own light. The migration notes cover vertex shaders, not
+    this.
+  - Collision is still the game's own, and a sub-grid holds edits, not a
+    generator: a lift's whole block would be millions of edits (2.2 M on
+    E1M3), so only its shell goes in, and collision reads the movers'
+    planes rather than the sub-grids' voxels. A sub-grid whose voxels come
+    from a lookup, or a box read of a moved grid, would let collision and
+    carving use the sub-grid itself.
 - **LOD would lose thin walls.** A coarse level samples every `1 << L`th
   voxel, so one-voxel walls and steps vanish or flicker between levels. The
   app uses no LOD, so the view distance is bounded by the chunk count.

@@ -86,11 +86,20 @@ impl VoxelMap {
 
         let mut flat_ids = Names::default();
         let mut wall_ids = Names::default();
-        let ceilings = if options.open_doors {
+        let mut ceilings = if options.open_doors {
             opened_ceilings(map)
         } else {
             map.sectors.iter().map(|s| s.ceiling as i32).collect()
         };
+        let mut floors: Vec<i32> = map.sectors.iter().map(|s| s.floor as i32).collect();
+        for (&sector, &(floor, ceiling)) in &options.heights {
+            if let (Some(f), Some(c)) = (
+                floors.get_mut(sector as usize),
+                ceilings.get_mut(sector as usize),
+            ) {
+                (*f, *c) = (floor, ceiling);
+            }
+        }
         let table = |t: u8| {
             if options.sector_light {
                 light::stretch(t, options.contrast) + 1
@@ -109,11 +118,11 @@ impl VoxelMap {
         let mut sectors: Vec<SectorInfo> = map
             .sectors
             .iter()
-            .zip(&ceilings)
-            .map(|(sec, &ceiling)| SectorInfo {
-                floor: sec.floor as i32,
+            .zip(floors.iter().zip(&ceilings))
+            .map(|(sec, (&floor, &ceiling))| SectorInfo {
+                floor,
                 ceiling,
-                floor_v: to_voxel(sec.floor as i32, s),
+                floor_v: to_voxel(floor, s),
                 ceiling_v: to_voxel(ceiling, s),
                 // r_sky.h SKYFLATNAME.
                 sky: sec.ceiling_flat == "F_SKY1",
@@ -216,6 +225,28 @@ impl VoxelMap {
             })
             .collect();
 
+        // p_switch.c `P_InitSwitchList` pairs SW1 and SW2 textures; every
+        // pair in DOOM's list is named that way.
+        let mut switches = HashMap::new();
+        let in_use: Vec<String> = wall_ids.order.clone();
+        for name in in_use {
+            let partner = if let Some(rest) = name.strip_prefix("SW1") {
+                format!("SW2{rest}")
+            } else if let Some(rest) = name.strip_prefix("SW2") {
+                format!("SW1{rest}")
+            } else {
+                continue;
+            };
+            let (a, b) = (
+                wall_ids.id(&name, walls_by_name),
+                wall_ids.id(&partner, walls_by_name),
+            );
+            if a != NO_TEX && b != NO_TEX {
+                switches.insert(a, b);
+                switches.insert(b, a);
+            }
+        }
+
         let mut vm = VoxelMap {
             palette,
             s,
@@ -241,6 +272,7 @@ impl VoxelMap {
                 pixels: p.pixels.clone(),
             }),
             tables: colour_tables(colormap),
+            switches,
             tiles: Tiles::new(0, 0, |_, _| Stats::VOID),
             spawn: ([0.0; 3], 0.0),
             sky: [90, 110, 140],
@@ -423,7 +455,7 @@ impl VoxelMap {
 
 /// The first voxel whose centre is at or above height `h`:
 /// `ceil(h/s − 1/2)`.
-fn to_voxel(h: i32, s: i32) -> i32 {
+pub fn to_voxel(h: i32, s: i32) -> i32 {
     (2 * h - s).div_euclid(2 * s) + ((2 * h - s).rem_euclid(2 * s) != 0) as i32
 }
 

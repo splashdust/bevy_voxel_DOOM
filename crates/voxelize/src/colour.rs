@@ -79,10 +79,12 @@ impl VoxelMap {
         air: u16,
         [x, y, z]: [i32; 3],
         (dx, dz): (i32, i32),
+        switched: Option<u16>,
     ) -> Voxel {
         let line = self.lines[col] & !crate::MASKED;
         let (ax, ay, _) = self.centre(x + dx, y, z + dz);
-        let w = self.wall_texel_at(line, air, [x, y, z], (ax, ay), (dx, dz));
+        let flip = switched == Some(line);
+        let w = self.wall_texel_at(line, air, [x, y, z], (ax, ay), (dx, dz), flip);
         if w.lamp > 0 {
             return Voxel::Emissive {
                 index: w.texel,
@@ -96,6 +98,7 @@ impl VoxelMap {
     /// voxel `[x, y, z]`, as seen from air of sector `air`, which lies on the
     /// side of map point `air_point`. Without a texture there it is the air
     /// sector's floor flat at column `(x + dx, z + dz)`, which never glows.
+    /// With `flip`, a switch texture shows its partner.
     pub(crate) fn wall_texel_at(
         &self,
         line: u16,
@@ -103,6 +106,7 @@ impl VoxelMap {
         [x, y, z]: [i32; 3],
         air_point: (f64, f64),
         (dx, dz): (i32, i32),
+        flip: bool,
     ) -> WallTexel {
         let air_sec = &self.sectors[air as usize];
         let fallback = WallTexel {
@@ -178,6 +182,10 @@ impl VoxelMap {
                     return fallback;
                 }
             }
+        };
+        let tex = match self.switches.get(&tex) {
+            Some(&partner) if flip => partner,
+            _ => tex,
         };
         match self.wall_texel(li, side, facing, tex, top, px, py, h) {
             Some(texel) => WallTexel {

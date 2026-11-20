@@ -14,7 +14,7 @@ doom_voxelize = { path = "crates/voxelize" }
 bevy = { version = "0.20", default-features = false, features = ["3d", "ui", "bevy_audio", "wav"] }
 # For a local checkout of the crate, see "Which bevy_voxel_world" in the
 # README.
-bevy_voxel_world = { version = "0.19.3", features = ["light_propagation"] }
+bevy_voxel_world = { git = "https://github.com/splashdust/bevy_voxel_world", rev = "6bba173", features = ["light_propagation", "sub_grids"] }
 # Physics for the debris a shot throws out.
 avian3d = { version = "0.8", default-features = false, features = ["3d", "parry-f32", "parallel"] }
 

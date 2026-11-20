@@ -11,8 +11,11 @@ mod debris;
 mod hud;
 mod info;
 mod input;
+mod levels;
+mod movers;
 mod player;
 mod sound;
+mod specials;
 mod sprites;
 mod weapon;
 mod world;
@@ -60,20 +63,40 @@ fn main() -> AppExit {
         std::process::exit(1);
     }
 
+    let data = wad.map(&map_name).unwrap_or_else(|e| {
+        eprintln!("error: can't read {map_name}: {e}");
+        std::process::exit(1);
+    });
+    let specials = specials::Specials::new(&data);
     let options = Options {
         units_per_voxel: args.units_per_voxel,
         sector_light: args.light.sector_light(),
         contrast: args.contrast,
         open_doors: !args.closed_doors,
+        heights: specials.open_heights(),
         lamps: args.light.propagated().then_some(args.knobs.lamp_level),
         sector_glow: args.light.sector_glow(),
     };
+    // The movers' other ends, for their sub-grids: see `movers`.
+    let shut_options = Options {
+        open_doors: false,
+        heights: specials.shut_heights(),
+        ..options.clone()
+    };
     let started = Instant::now();
-    let map = VoxelMap::build(&wad, &map_name, &options).unwrap_or_else(|e| {
-        eprintln!("error: can't build {map_name}: {e}");
-        std::process::exit(1);
+    let (map, shut) = std::thread::scope(|scope| {
+        let shut = scope.spawn(|| VoxelMap::build(&wad, &map_name, &shut_options));
+        let map = VoxelMap::build(&wad, &map_name, &options);
+        (map, shut.join().expect("the shut build doesn't panic"))
     });
-    let things = wad.map(&map_name).map(|m| m.things).unwrap_or_default();
+    let (map, shut) = match (map, shut) {
+        (Ok(map), Ok(shut)) => (map, shut),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("error: can't build {map_name}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let things = data.things.clone();
     let sprites = sprites::SpriteBank::load(&wad);
     let sounds = (!args.mute).then(|| sound::SoundBank::load(&wad));
     drop(wad);
@@ -96,6 +119,13 @@ fn main() -> AppExit {
     }
 
     let (spawn, spawn_yaw) = map.spawn();
+    let sector_heights = movers::SectorHeights(
+        data.sectors
+            .iter()
+            .map(|s| (s.floor as i32, s.ceiling as i32))
+            .collect(),
+    );
+    let movers = movers::Movers::new(&data, specials, &map, Arc::new(shut));
     let map = Arc::new(map);
     let s = args.units_per_voxel as f32;
     let start = CameraStart {
@@ -110,6 +140,7 @@ fn main() -> AppExit {
         yaw: start.yaw,
         mode: if args.fly { Mode::Fly } else { Mode::Walk },
         god: args.god,
+        health: args.health,
         units: s,
     };
     let [r, g, b] = map.sky_colour();
@@ -124,6 +155,8 @@ fn main() -> AppExit {
             args::LightMode::Sector | args::LightMode::Both | args::LightMode::SectorGlow
         ),
     };
+
+    let next_level = levels::NextLevel::default();
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -173,6 +206,14 @@ fn main() -> AppExit {
         freeze: args.freeze,
     })
     .add_plugins(sound::SoundPlugin { bank: sounds })
+    .add_plugins(movers::MoversPlugin)
+    .add_plugins(levels::LevelsPlugin {
+        map: map_name.clone(),
+        maps: maps.clone(),
+        next: next_level.clone(),
+    })
+    .insert_resource(movers)
+    .insert_resource(sector_heights)
     .insert_resource(ClearColor(Color::srgb_u8(r, g, b)))
     .insert_resource(start)
     .insert_resource(player_start)
@@ -221,5 +262,15 @@ fn main() -> AppExit {
                 .before(capture::CaptureSet::Shoot),
         );
     }
-    app.run()
+    let exit = app.run();
+    // An exit switch: start the next map in a fresh run.
+    let next = next_level
+        .0
+        .lock()
+        .expect("nothing panics holding it")
+        .take();
+    match next {
+        Some((map, health)) if exit == AppExit::Success => levels::relaunch(&map, health),
+        _ => exit,
+    }
 }

@@ -185,7 +185,13 @@ fn track_settling(
     let count = chunks.iter().count();
     let busy = chunks
         .iter()
-        .filter(|chunk| voxel_world.chunk_state(chunk.key()) != Some(ChunkStatus::Ready))
+        // A sub-grid's chunk keys are on its own grid.
+        .filter(|chunk| {
+            voxel_world
+                .grid(chunk.grid())
+                .and_then(|grid| grid.chunk_state(chunk.key()))
+                != Some(ChunkStatus::Ready)
+        })
         .count();
     let chunks_quiet = busy == 0 && count > 0 && count == settled.count;
     let light_settled = voxel_world.light_is_settled();

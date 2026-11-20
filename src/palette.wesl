@@ -16,7 +16,7 @@ import bevy_pbr::render::forward_io::FragmentOutput;
 import bevy_voxel_world::voxel_io::VoxelVertexOutput;
 
 @if(VOXEL_LIGHT)
-import bevy_voxel_world::light::{sample_light, sky_brightness, voxel_falloff};
+import bevy_voxel_world::light::{sample_face_light, sky_brightness, voxel_falloff};
 
 struct ShaderLight {
     lamp_gain: f32,
@@ -52,7 +52,19 @@ fn fragment(in: VoxelVertexOutput) -> FragmentOutput {
     var out: FragmentOutput;
     var colour = palette[in.tex_idx[0]].rgb * in.color.rgb;
     @if(VOXEL_LIGHT) {
-        let levels = sample_light(in.light_tag, in.local_position, in.local_normal);
+        // A sub-grid's face (a door, a lift) also reads the world's light
+        // where it is now.
+        @if(SUB_GRIDS)
+        let grid_position = in.world_grid_position;
+        @if(!SUB_GRIDS)
+        let grid_position = in.world_position.xyz;
+        let levels = sample_face_light(
+            in.light_tag,
+            in.local_position,
+            in.local_normal,
+            grid_position,
+            in.world_normal,
+        );
         var lamp = voxel_falloff(levels.voxel);
         if levels.own_voxel.x >= light.glow_from {
             lamp += LAMP_GLOW * voxel_falloff(levels.own_voxel);

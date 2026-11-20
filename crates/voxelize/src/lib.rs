@@ -25,6 +25,8 @@
 //! [`Options::sector_glow`], every surface voxel also glows at a level that
 //! stands for its sector's light: see `light::GlowLevels`.
 
+use std::collections::HashMap;
+
 use doom_wad::{Palette, Picture, Wad, WadError};
 
 mod build;
@@ -35,7 +37,7 @@ mod light;
 mod locate;
 mod tiles;
 
-pub use build::sky_texture_name;
+pub use build::{sky_texture_name, to_voxel as height_row};
 pub use interior::INTERIOR_DEPTH;
 pub use lamps::{LampLevel, LAMP_THINGS};
 
@@ -77,6 +79,12 @@ pub struct Options {
     pub contrast: f32,
     /// Bake door sectors open, as if every door had been used.
     pub open_doors: bool,
+    /// Sectors built at other heights than the map stores: sector id to
+    /// `(floor, ceiling)` in map units. Applied after
+    /// [`open_doors`](Self::open_doors), so a sector here takes these
+    /// heights whether or not it is a door. The app builds a map's moving
+    /// sectors once at each end of their travel this way.
+    pub heights: HashMap<u16, (i32, i32)>,
     /// Light sources: the bright texels of light flats and wall textures
     /// glow, and light-giving things stand as pillars. `None` leaves both
     /// out.
@@ -95,6 +103,7 @@ impl Default for Options {
             sector_light: true,
             contrast: 1.0,
             open_doors: true,
+            heights: HashMap::new(),
             lamps: None,
             sector_glow: false,
         }
@@ -186,6 +195,9 @@ pub struct VoxelMap {
     walls: Vec<Picture>,
     /// Colour tables: 0 is the identity, 1 + k is COLORMAP table k.
     tables: Vec<[u8; 256]>,
+    /// Switch textures: each `SW1…` wall texture in use to its `SW2…`
+    /// partner and back, by wall texture id. See [`VoxelMap::switch_voxels`].
+    switches: HashMap<u16, u16>,
     tiles: tiles::Tiles,
     spawn: ([f32; 3], f32),
     /// See [`VoxelMap::colour_gain`].
@@ -209,6 +221,12 @@ impl VoxelMap {
     /// The voxel at `p`. Thread-safe and deterministic: the app calls this
     /// from the voxel world's worker threads.
     pub fn voxel(&self, p: [i32; 3]) -> Voxel {
+        self.voxel_with(p, None)
+    }
+
+    /// [`voxel`](Self::voxel), with the switch textures of linedef
+    /// `switched`, if any, flipped to their partners.
+    fn voxel_with(&self, p: [i32; 3], switched: Option<u16>) -> Voxel {
         let [x, y, z] = p;
         if y >= self.max[1] {
             return Voxel::Air;
@@ -242,7 +260,7 @@ impl VoxelMap {
         if near.dist == 1 {
             for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 if let Some(air) = self.air_sector(x + dx, y, z + dz) {
-                    return self.wall(col, air, p, (dx, dz));
+                    return self.wall(col, air, p, (dx, dz), switched);
                 }
             }
         }
@@ -407,6 +425,67 @@ impl VoxelMap {
         let sec = &self.sectors[self.column_sector(x, z)? as usize];
         let ceiling = if sec.sky { self.max[1] } else { sec.ceiling_v };
         Some((sec.floor_v, ceiling))
+    }
+
+    /// Every voxel column `[x, z]` of `sector`.
+    pub fn sector_columns(&self, sector: u16) -> Vec<[i32; 2]> {
+        let mut out = Vec::new();
+        for (i, &s) in self.columns.iter().enumerate() {
+            if s == sector {
+                let i = i as i32;
+                out.push([self.min[0] + i % self.width, self.min[2] + i / self.width]);
+            }
+        }
+        out
+    }
+
+    /// Whether linedef `line` shows a switch texture, `SW1…` or `SW2…`,
+    /// with a partner in the WAD.
+    pub fn has_switch(&self, line: u16) -> bool {
+        self.line_info.get(line as usize).is_some_and(|li| {
+            li.sides.iter().flatten().any(|side| {
+                [side.upper, side.middle, side.lower]
+                    .iter()
+                    .any(|t| self.switches.contains_key(t))
+            })
+        })
+    }
+
+    /// The wall voxels of linedef `line` that change when its switch
+    /// textures flip to their partners (`SW1…` to `SW2…` and back, as
+    /// p_switch.c `P_ChangeSwitchTexture` does), with the voxels they become.
+    /// Flipping the same line again gives the voxels [`voxel`](Self::voxel)
+    /// gives. Empty for a line without a switch texture.
+    pub fn switch_voxels(&self, line: u16) -> Vec<([i32; 3], Voxel)> {
+        if !self.has_switch(line) {
+            return Vec::new();
+        }
+        let li = &self.line_info[line as usize];
+        let s = self.s as f64;
+        let b = [li.a[0] + li.dir[0] * li.len, li.a[1] + li.dir[1] * li.len];
+        let x0 = (li.a[0].min(b[0]) / s).floor() as i32 - 2;
+        let x1 = (li.a[0].max(b[0]) / s).ceil() as i32 + 2;
+        let z0 = (-li.a[1].max(b[1]) / s).floor() as i32 - 2;
+        let z1 = (-li.a[1].min(b[1]) / s).ceil() as i32 + 2;
+        let mut out = Vec::new();
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                let Some(col) = self.column(x, z) else {
+                    continue;
+                };
+                if self.lines[col] & !MASKED != line {
+                    continue;
+                }
+                for y in self.min[1]..self.max[1] {
+                    let p = [x, y, z];
+                    let flipped = self.voxel_with(p, Some(line));
+                    if flipped != self.voxel(p) {
+                        out.push((p, flipped));
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn column(&self, x: i32, z: i32) -> Option<usize> {

@@ -24,6 +24,7 @@ use doom_voxelize::{Voxel, VoxelMap};
 
 use crate::args::{LightKnobs, LightMode};
 use crate::collide::Solid;
+use crate::movers::MoverSolids;
 
 /// How far chunks spawn, in DOOM map units: a long DOOM sightline.
 const VIEW_DISTANCE_UNITS: i32 = 2048;
@@ -198,7 +199,8 @@ pub fn track_edited_chunks(
 }
 
 /// What bodies, sight lines and shots collide with: the voxel world's
-/// voxels, edits included, with flashes counting as air.
+/// voxels, edits included, with flashes counting as air, and the doors,
+/// lifts and floors on sub-grids (see `movers`).
 ///
 /// A chunk without edits holds just what the map generates, so its voxels
 /// come from [`VoxelMap::is_solid`], which is much cheaper than
@@ -210,6 +212,7 @@ pub struct WorldSolid {
     edited: Arc<HashSet<IVec3>>,
     get: Arc<dyn Fn(IVec3) -> WorldVoxel<u16> + Send + Sync>,
     flash: Option<u16>,
+    movers: MoverSolids,
 }
 
 impl WorldSolid {
@@ -217,18 +220,27 @@ impl WorldSolid {
         voxel_world: &VoxelWorld<DoomWorld>,
         map: &GameMap,
         edited: &EditedChunks,
+        movers: &MoverSolids,
     ) -> Self {
         WorldSolid {
             map: Arc::clone(&map.map),
             edited: Arc::clone(&edited.0),
             get: voxel_world.get_voxel_fn(),
             flash: map.flash,
+            movers: movers.clone(),
         }
     }
 }
 
 impl Solid for WorldSolid {
     fn solid(&self, p: IVec3) -> bool {
+        if !self.movers.is_empty() {
+            if let Some(sector) = self.map.column_sector(p.x, p.z) {
+                if self.movers.solid(sector, p.y) {
+                    return true;
+                }
+            }
+        }
         if !self
             .edited
             .contains(&p.div_euclid(IVec3::splat(CHUNK_SIZE_I)))
@@ -246,7 +258,7 @@ impl Solid for WorldSolid {
 /// chunks, far more than the crate's default of 1,024.
 const SLOT_CAPACITY: u32 = 4096;
 
-fn world_voxel(voxel: Voxel) -> WorldVoxel<u16> {
+pub(crate) fn world_voxel(voxel: Voxel) -> WorldVoxel<u16> {
     match voxel {
         Voxel::Air => WorldVoxel::Air,
         Voxel::Solid(index) => WorldVoxel::Solid(material(index, 0)),

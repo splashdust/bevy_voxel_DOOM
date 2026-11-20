@@ -11,6 +11,7 @@
 //! - `turn:DEG`: turn left by DEG degrees (right when negative);
 //! - `pitch:DEG`: look DEG degrees up from level;
 //! - `fire:N`: hold the trigger for N chaingun shots;
+//! - `use`: press use once;
 //! - `wait:S`: stand still for S seconds;
 //! - `shot:PATH`: save a screenshot;
 //! - `respawn`: respawn, when dead.
@@ -39,6 +40,8 @@ pub struct Intent {
     pub run: bool,
     /// Jump pressed (held counts: it jumps again on landing).
     pub jump: bool,
+    /// Use pressed this frame: open a door, press a switch.
+    pub use_: bool,
     /// The trigger is held.
     pub fire: bool,
     /// Radians to turn left and to look up.
@@ -69,6 +72,7 @@ pub enum Step {
     Wait(f32),
     Shot(String),
     Respawn,
+    Use,
 }
 
 /// A scripted run; see the module docs.
@@ -138,6 +142,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Step>, String> {
                 "wait" => Ok(Step::Wait(number()?)),
                 "shot" if !arg.is_empty() => Ok(Step::Shot(arg.to_string())),
                 "respawn" => Ok(Step::Respawn),
+                "use" => Ok(Step::Use),
                 _ => Err(format!("unknown script step {step:?}")),
             }
         })
@@ -182,7 +187,8 @@ pub fn read_devices(
             - (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
                 as i32 as f32,
         run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
-        jump: keys.pressed(KeyCode::Space),
+        jump: keys.pressed(KeyCode::KeyC),
+        use_: keys.just_pressed(KeyCode::Space),
         fire: *trigger,
         turn,
         look_up,
@@ -258,6 +264,10 @@ pub fn run_script(
         Step::Wait(seconds) => script.elapsed >= seconds,
         Step::Respawn => {
             fresh.respawn = true;
+            true
+        }
+        Step::Use => {
+            fresh.use_ = true;
             true
         }
         Step::Shot(path) => {

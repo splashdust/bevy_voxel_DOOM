@@ -120,7 +120,8 @@ impl VoxelMap {
                 };
                 // Only surface voxels glow: a lamp's texture carried into the
                 // solid is plain.
-                let w = self.wall_texel_at(near.line, near.air, p, air_point, (0, 0));
+                let w =
+                    self.wall_texel_at(near.line, near.air, p, air_point, (0, 0), false);
                 return self.darkened(w.texel, w.table, wall_depth);
             }
         }

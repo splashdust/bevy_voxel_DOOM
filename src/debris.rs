@@ -502,7 +502,12 @@ fn snap(
     frame: Res<FrameCount>,
     time: Res<Time>,
 ) {
-    let published: Vec<ChunkKey> = published.read().map(|p| p.chunk_key).collect();
+    // The world's chunks only: a sub-grid's chunk keys are on its own grid.
+    let published: Vec<ChunkKey> = published
+        .read()
+        .filter(|p| p.grid == Grid::World)
+        .map(|p| p.chunk_key)
+        .collect();
     for (entity, mut snap, mut transform) in &mut snapping {
         snap.time += time.delta_secs();
         let t = (snap.time / SNAP_TIME).min(1.0);

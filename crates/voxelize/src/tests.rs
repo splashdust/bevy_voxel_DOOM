@@ -281,6 +281,7 @@ fn build(open_doors: bool, sector_light: bool) -> VoxelMap {
         sector_light,
         contrast: 1.0,
         open_doors,
+        heights: Default::default(),
         lamps: None,
         sector_glow: false,
     };
@@ -317,6 +318,7 @@ fn build_lamps(lamps: Option<LampLevel>, sector_light: bool) -> VoxelMap {
         sector_light,
         contrast: 1.0,
         open_doors: true,
+        heights: Default::default(),
         lamps,
         sector_glow: false,
     };
@@ -341,6 +343,7 @@ fn build_glow(lamps: Option<LampLevel>) -> VoxelMap {
         sector_light: false,
         contrast: 1.0,
         open_doors: true,
+        heights: Default::default(),
         lamps,
         sector_glow: true,
     };
@@ -863,4 +866,32 @@ fn things_take_their_sectors_light() {
     // The test colormap adds the table number.
     assert_eq!(m.lit(7, 1 + 10), 7 + 10);
     assert_eq!(m.lit(7, 0), 7);
+}
+
+#[test]
+fn heights_override_what_the_map_stores() {
+    // Step B lowered to 0 and door C half open, as a mover would build them.
+    let options = Options {
+        heights: HashMap::from([(1, (0, 128)), (2, (16, 64))]),
+        open_doors: false,
+        ..Options::default()
+    };
+    let vm = VoxelMap::from_map_data(
+        &test_map(),
+        palette(),
+        &colormap(),
+        &textures(),
+        &options,
+    )
+    .unwrap();
+    let b = vm.sector_columns(1);
+    let c = vm.sector_columns(2);
+    // B is 64 units across and C 16, at 2 units a voxel.
+    assert_eq!(b.len() % 32, 0);
+    assert_eq!(c.len() % 8, 0);
+    let [x, z] = b[0];
+    assert_eq!(vm.column_air(x, z), Some((0, 64)));
+    let [x, z] = c[0];
+    assert_eq!(vm.column_air(x, z), Some((8, 32)));
+    assert_eq!(crate::height_row(16, 2), 8);
 }
