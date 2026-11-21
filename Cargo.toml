@@ -3,6 +3,7 @@ name = "doom_voxels"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "GPL-2.0-or-later"
 description = "An experiment: vanilla DOOM maps from a WAD file as a bevy_voxel_world voxel world"
 
 [workspace]

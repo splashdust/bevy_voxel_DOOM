@@ -3,6 +3,7 @@ name = "doom_voxelize"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "GPL-2.0-or-later"
 description = "Turns a vanilla DOOM map into voxels, one palette colour per voxel"
 
 [dependencies]

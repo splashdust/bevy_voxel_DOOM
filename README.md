@@ -123,3 +123,10 @@ its north is −z.
 - **The voxelizer** (`crates/voxelize`). Turns floors, ceilings and walls into solid and empty voxels.
 - **Inside the solid.** Holes show the nearby texture going on inside, getting darker.
 - **The WAD reader** (`crates/wad`). Reads maps, textures and colours from the WAD file.
+
+## Licence
+
+GPL-2.0-or-later; the full text is in [LICENSE](LICENSE). The weapons,
+monsters and pickups follow the logic and numbers of id Software's DOOM
+source code, which is released under the GPL. WAD files are not included and
+carry their own licences.
