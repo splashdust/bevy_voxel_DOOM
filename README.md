@@ -2,7 +2,8 @@
 
 This repo holds a "vibe-coded" experiment, using [Bevy](https://bevy.org/) and [bevy_voxel_world](https://github.com/splashdust/bevy_voxel_world) to generate DOOM maps from WADs. The game plays with monsters, weapons and sound. BVW sub-grids are used for doors and moving platforms. The world is destructible, and shooting walls will take chunks of voxels out.
 
-<img alt src="https://github.com/user-attachments/assets/a3a6fa8a-cd72-4cca-8f25-d716cfd1690b" />
+<img alt src="https://github.com/user-attachments/assets/8fa690b4-ed10-443b-b35d-1afa82292743" />
+
 
 Instructions and documentation in the wall-of-slop below :)
 
